@@ -204,6 +204,22 @@ class RuntimeOptionContracts(unittest.TestCase):
         self.assertIn("[Malt-Cursor] event=set", patch02_cs)
         self.assertIn("[Malt-Cursor-Render]", patch09_cs)
 
+    def test_cursor_bridge_and_dxmt_map_nowait_contracts(self):
+        patch05 = patch_text("05-render-thread-qos-and-dxmt-cache")
+        patch09 = patch_text("09-iosurface-direct-present-and-virtio-input")
+        patch02_cs = patch_text("02-cocoaspice-cursor-overlay")
+        self.assertIn('@"d3d11.ignoreMapFlagNoWait=True"', patch05)
+        self.assertIn("applyExternalCursorShape(data:width:height:hotspot:at:visible:)", patch02_cs)
+        self.assertIn("applyExternalCursorMove(to:visible:)", patch02_cs)
+        self.assertIn("hideExternalCursor()", patch02_cs)
+        self.assertIn("[Malt-Cursor] event=bridge_set", patch02_cs)
+        self.assertIn("com.malt.cursor.0", patch09)
+        self.assertIn("cursorSocketURL", patch09)
+        self.assertIn("MaltCursorBridgeManager", patch09)
+        self.assertIn("UTM_DISABLE_CURSOR_BRIDGE", patch09)
+        self.assertIn('if physMem <= 10_737_418_240 { return "2G" }', patch09)
+        self.assertIn("num-queues=\\(blkQueues)", patch09)
+
     def test_performance_architecture_storage_and_memory_contracts(self):
         patch09 = patch_text("09-iosurface-direct-present-and-virtio-input")
         settings = (ROOT / "WhiskyKit/Sources/WhiskyKit/Orchestration/UnifiedLaunchSettings.swift").read_text(

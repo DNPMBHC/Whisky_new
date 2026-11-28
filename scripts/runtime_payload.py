@@ -30,6 +30,7 @@ SCRIPT_NAMES = (
     'apply-optimizer.ps1',
     'rollback-optimizer.ps1',
     'anticheat-minimal-win11-arm64.json',
+    'malt-cursor-bridge.ps1',
 )
 USER_NET_PROXY_RELATIVE = 'Contents/Helpers/malt-net-proxy'
 BLOCKED_DIRECTORIES = {'site-packages', '__pycache__', 'test', 'tests', 'idlelib',
@@ -484,16 +485,18 @@ def source_layout(workspace):
     apply_opt = list(modules.glob('*/scripts/apply-optimizer.ps1'))
     rollback_opt = list(modules.glob('*/scripts/rollback-optimizer.ps1'))
     profile_opt = list(modules.glob('*/profiles/anticheat-minimal-win11-arm64.json'))
+    cursor_bridge = list(modules.glob('*/scripts/malt-cursor-bridge.ps1'))
     daemons = list(modules.glob('*/vmnet-bridge/SMAppService.plist'))
     proxy_go = repos[0] / 'scripts/malt_net_proxy.go'
     if (len(kiosk) != 1 or len(apply_opt) != 1 or len(rollback_opt) != 1
-            or len(profile_opt) != 1 or len(daemons) != 1 or not proxy_go.is_file()):
+            or len(profile_opt) != 1 or len(cursor_bridge) != 1
+            or len(daemons) != 1 or not proxy_go.is_file()):
         raise PayloadError('required guest script, proxy source, or service manifest is missing or ambiguous')
     sources = list(daemons[0].parent.glob('*.c'))
     if len(sources) != 1:
         raise PayloadError('exactly one native network bridge source is required')
     return (manager, kiosk[0], apply_opt[0], rollback_opt[0], profile_opt[0],
-            daemons[0], sources[0], proxy_go)
+            cursor_bridge[0], daemons[0], sources[0], proxy_go)
 
 
 def resolve_go_binary():
@@ -735,7 +738,7 @@ def verify_manifest(app, manifest):
         return problems + ['missing_inventory_or_requirements']
     expected_keys = {'helperBinary', 'helperInfo', 'containerControlBinary', 'pythonExecutable', 'pythonLicense',
                      'managerScript', 'kioskScript', 'optimizerApplyScript', 'optimizerRollbackScript',
-                     'optimizerProfile', 'provisioningGuide', 'provisioningGuideChinese',
+                     'optimizerProfile', 'cursorBridgeScript', 'provisioningGuide', 'provisioningGuideChinese',
                      'networkHelper', 'networkService', 'userNetProxy'}
     if set(required) != expected_keys:
         problems.append('incomplete_required_resources')
@@ -798,11 +801,11 @@ def embed(app, workspace, python_source=None, sign_identity='-'):
         raise PayloadError('embedding requires macOS system build and signing tools')
     helper, helper_binary = select_helper(app)
     helper_signing = resign_nested_code(helper, sign_identity, include_root=True)
-    manager, kiosk, apply_opt, rollback_opt, profile_opt, service, bridge, proxy_go = source_layout(workspace)
+    manager, kiosk, apply_opt, rollback_opt, profile_opt, cursor_bridge, service, bridge, proxy_go = source_layout(workspace)
     prefix = official_python_prefix(python_source)
     scripts = app / 'Contents/Resources/RuntimeScripts'
     scripts.mkdir(parents=True, exist_ok=True)
-    script_sources = (manager, kiosk, apply_opt, rollback_opt, profile_opt)
+    script_sources = (manager, kiosk, apply_opt, rollback_opt, profile_opt, cursor_bridge)
     for source, content in zip(script_sources, read_stable_files(script_sources)):
         (scripts / source.name).write_bytes(content)
     (scripts / 'PROVISIONING.md').write_text(PROVISIONING, encoding='utf-8')
@@ -821,6 +824,7 @@ def embed(app, workspace, python_source=None, sign_identity='-'):
         'optimizerApplyScript': 'Contents/Resources/RuntimeScripts/' + SCRIPT_NAMES[2],
         'optimizerRollbackScript': 'Contents/Resources/RuntimeScripts/' + SCRIPT_NAMES[3],
         'optimizerProfile': 'Contents/Resources/RuntimeScripts/' + SCRIPT_NAMES[4],
+        'cursorBridgeScript': 'Contents/Resources/RuntimeScripts/' + SCRIPT_NAMES[5],
         'provisioningGuide': 'Contents/Resources/RuntimeScripts/PROVISIONING.md',
         'provisioningGuideChinese': 'Contents/Resources/RuntimeScripts/PROVISIONING.zh-Hans.md',
         'networkHelper': network_binary,

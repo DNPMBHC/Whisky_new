@@ -34,6 +34,7 @@ struct ContainerGuestOptimizationReport: Decodable, Sendable {
 struct ContainerGraphicsNetworkProbe: Decodable, Sendable {
     let viogpu3dPresent, secureBootEnabled: Bool
     let driverName: String
+    let overlayDisabled, userTransparencyDisabled, fseDisabled, cursorBridgeInstalled: Bool?
 }
 
 struct ContainerProvisioningCheckpoint: Codable, Equatable, Sendable {
@@ -113,7 +114,11 @@ enum ContainerProvisioningPipeline {
         }
 
         let target = resolveSafeResources(settings: settings, hardware: hardware)
-        try mutateHardwareConfig(&config, cpu: target.cpu, memoryMiB: target.memoryMiB)
+        let queues = HardwareAutoTuner.recommendedVirtIOBlockQueues(forVCPUCount: target.cpu)
+        let fpsLimit = min(ContainerProvisioningConstants.fpsLimitDefault, max(60, hardware.displayRefreshRateHz))
+        try mutateHardwareConfig(
+            &config, cpu: target.cpu, memoryMiB: target.memoryMiB, queues: queues, fpsLimit: fpsLimit
+        )
         let backupURL = bundle.appending(path: ContainerProvisioningConstants.hardwareBackupName)
         let backupPath = backupURL.path(percentEncoded: false)
         if !fileManager.fileExists(atPath: backupPath) {
@@ -123,16 +128,17 @@ enum ContainerProvisioningPipeline {
         let encoded = try PropertyListSerialization.data(fromPropertyList: config, format: format, options: 0)
         try encoded.write(to: configURL, options: .atomic)
         do {
-            try verifyHardwareConfig(at: configURL, expectedUUID: uuid, cpu: target.cpu, memoryMiB: target.memoryMiB)
+            try verifyHardwareConfig(
+                at: configURL, expectedUUID: uuid, cpu: target.cpu, memoryMiB: target.memoryMiB, fpsLimit: fpsLimit
+            )
         } catch {
             try? original.write(to: configURL, options: .atomic)
             throw error
         }
         return ContainerHardwarePipelineResult(
-            cpuCount: target.cpu, memoryMiB: target.memoryMiB, virtioBlkQueues: 4,
-            fpsLimit: ContainerProvisioningConstants.fpsLimitDefault,
-            summary: "已配置 \(target.cpu) vCPU / \(target.memoryMiB / 1024) GiB、VirtIO-Blk 4 队列、"
-                + "WHQL virtio-mouse、清零 usb-redir、保留 intel-hda 与 120 FPS 三重缓冲。"
+            cpuCount: target.cpu, memoryMiB: target.memoryMiB, virtioBlkQueues: queues, fpsLimit: fpsLimit,
+            summary: "已配置 \(target.cpu) vCPU / \(target.memoryMiB / 1024) GiB、VirtIO-Blk \(queues) 队列、"
+                + "WHQL virtio-mouse、清零 usb-redir、保留 intel-hda 与 \(fpsLimit) FPS 三重缓冲。"
         )
     }
 
@@ -223,24 +229,12 @@ enum ContainerProvisioningPipeline {
         }
         return base
     }
-
-    static func graphicsProbeScript() -> String {
-        """
-        $ErrorActionPreference='Stop';
-        $drivers=@(pnputil.exe /enum-drivers 2>$null);
-        $hasVioGpu3dInf=($drivers | Out-String) -match '(?i)viogpu3d\\.inf';
-        $adapter=[string](Get-CimInstance Win32_VideoController -EA SilentlyContinue | Select-Object -First 1).Name;
-        $isLegacyDod=$adapter -match '(?i)\\bDOD\\b|viogpudo';
-        $hasVioGpu=$hasVioGpu3dInf -and (-not $isLegacyDod);
-        $sb=$false; try { $sb=[bool](Confirm-SecureBootUEFI) } catch { $sb=$false };
-        $report=@{ viogpu3dPresent=[bool]$hasVioGpu; driverName=$adapter; secureBootEnabled=[bool]$sb };
-        Write-Output ('MALT_GFX_PROBE_V1=' + ($report | ConvertTo-Json -Compress));
-        """
-    }
 }
 
 private extension ContainerProvisioningPipeline {
-    static func mutateHardwareConfig(_ config: inout [String: Any], cpu: Int, memoryMiB: Int) throws {
+    static func mutateHardwareConfig(
+        _ config: inout [String: Any], cpu: Int, memoryMiB: Int, queues: Int, fpsLimit: Int
+    ) throws {
         var system = config["System"] as? [String: Any] ?? [:]
         system["CPUCount"] = cpu
         system["MemorySize"] = memoryMiB
@@ -270,10 +264,10 @@ private extension ContainerProvisioningPipeline {
 
         var qemu = config["QEMU"] as? [String: Any] ?? [:]
         qemu["BalloonDevice"] = false
-        qemu["RendererFPSLimit"] = ContainerProvisioningConstants.fpsLimitDefault
-        qemu["QEMURendererFPSLimit"] = ContainerProvisioningConstants.fpsLimitDefault
+        qemu["RendererFPSLimit"] = fpsLimit
+        qemu["QEMURendererFPSLimit"] = fpsLimit
         qemu["TripleBuffering"] = true
-        let updatedArgs = mergeHardwareArguments(extractAdditionalArguments(from: qemu), queues: 4)
+        let updatedArgs = mergeHardwareArguments(extractAdditionalArguments(from: qemu), queues: queues)
         try assertSafeQEMUArguments(updatedArgs)
         qemu["AdditionalArguments"] = updatedArgs
         config["QEMU"] = qemu
@@ -347,7 +341,9 @@ private extension ContainerProvisioningPipeline {
         }
     }
 
-    static func verifyHardwareConfig(at configURL: URL, expectedUUID: String, cpu: Int, memoryMiB: Int) throws {
+    static func verifyHardwareConfig(
+        at configURL: URL, expectedUUID: String, cpu: Int, memoryMiB: Int, fpsLimit: Int
+    ) throws {
         guard let readBack = try PropertyListSerialization.propertyList(
             from: Data(contentsOf: configURL), options: [], format: nil) as? [String: Any],
             let info = readBack["Information"] as? [String: Any],
@@ -360,7 +356,7 @@ private extension ContainerProvisioningPipeline {
             (input["DisableUsbRedir"] as? Bool) == true,
             (input["MaximumUsbShare"] as? Int) == 0,
             let qemu = readBack["QEMU"] as? [String: Any],
-            (qemu["QEMURendererFPSLimit"] as? Int) == ContainerProvisioningConstants.fpsLimitDefault
+            (qemu["QEMURendererFPSLimit"] as? Int) == fpsLimit
         else {
             throw UnifiedOrchestrationError.backendUnavailable("硬件管线配置回读校验失败，已自动回滚。")
         }

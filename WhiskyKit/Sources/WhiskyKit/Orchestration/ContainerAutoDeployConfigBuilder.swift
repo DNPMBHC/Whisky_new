@@ -23,7 +23,7 @@ public enum AutoDeployStage: String, Codable, CaseIterable, Sendable {
         case .runUnattendedInstall:
             return "执行无人值守安装并等待来宾工具就绪"
         case .injectOptimizationAndTrim:
-            return "注入 v3.2 驱动优化、移除云同步与系统瘦身"
+            return "注入 v3.3 驱动优化、清晰渲染、光标桥接与系统瘦身"
         case .compactAndRegister:
             return "卸载安装介质并执行容器磁盘离线瘦身"
         }
@@ -57,6 +57,7 @@ public struct AutoDeployRequest: Equatable, Sendable {
     public let containerName: String
     public let diskSizeGiB: Int
     public let driverDirectory: URL?
+    public let autoDownloadDrivers: Bool
     public let unattendedConfig: UnattendedWindowsConfig
     public let launchSettings: UnifiedLaunchSettings
     public let minimumISOSizeBytes: Int64
@@ -69,6 +70,7 @@ public struct AutoDeployRequest: Equatable, Sendable {
         containerName: String = "malt-win11-arm64",
         diskSizeGiB: Int = 64,
         driverDirectory: URL? = nil,
+        autoDownloadDrivers: Bool = true,
         unattendedConfig: UnattendedWindowsConfig = UnattendedWindowsConfig(),
         launchSettings: UnifiedLaunchSettings = UnifiedLaunchSettings(),
         minimumISOSizeBytes: Int64 = 1_073_741_824,
@@ -80,6 +82,7 @@ public struct AutoDeployRequest: Equatable, Sendable {
         self.containerName = containerName
         self.diskSizeGiB = diskSizeGiB
         self.driverDirectory = driverDirectory
+        self.autoDownloadDrivers = autoDownloadDrivers
         self.unattendedConfig = unattendedConfig
         self.launchSettings = launchSettings
         self.minimumISOSizeBytes = minimumISOSizeBytes
@@ -129,6 +132,26 @@ enum ContainerAutoDeployConfigBuilder {
         let containerName: String
         let cpuCount: Int
         let memoryMiB: Int
+        let fpsLimit: Int
+        let virtioBlkQueues: Int
+
+        init(
+            vmUUID: String,
+            diskUUID: String,
+            containerName: String,
+            cpuCount: Int,
+            memoryMiB: Int,
+            fpsLimit: Int = ContainerProvisioningConstants.fpsLimitDefault,
+            virtioBlkQueues: Int = 4
+        ) {
+            self.vmUUID = vmUUID
+            self.diskUUID = diskUUID
+            self.containerName = containerName
+            self.cpuCount = cpuCount
+            self.memoryMiB = memoryMiB
+            self.fpsLimit = fpsLimit
+            self.virtioBlkQueues = virtioBlkQueues
+        }
     }
 
     static func makeConfigDictionary(spec: Spec) -> [String: Any] {
@@ -152,7 +175,7 @@ enum ContainerAutoDeployConfigBuilder {
                 "Target": "virt",
                 "UEFIBoot": true
             ],
-            "QEMU": makeQEMUSection(),
+            "QEMU": makeQEMUSection(fpsLimit: spec.fpsLimit, queues: spec.virtioBlkQueues),
             "Display": [[
                 "DownscalingFilter": "Linear",
                 "DynamicResolution": false,
@@ -234,12 +257,12 @@ enum ContainerAutoDeployConfigBuilder {
         try? fileManager.removeItem(at: dataDir.appending(path: bootstrapFilename))
     }
 
-    private static func makeQEMUSection() -> [String: Any] {
+    private static func makeQEMUSection(fpsLimit: Int, queues: Int) -> [String: Any] {
         [
             "AdditionalArguments": [
                 "-object", "iothread,id=iothread0",
                 "-global", "virtio-blk-pci.iothread=iothread0",
-                "-global", "virtio-blk-pci.num-queues=4"
+                "-global", "virtio-blk-pci.num-queues=\(queues)"
             ],
             "BalloonDevice": false,
             "DebugLog": false,
@@ -248,8 +271,8 @@ enum ContainerAutoDeployConfigBuilder {
             "InterruptRemapping": true,
             "MemoryLock": false,
             "PS2Controller": false,
-            "QEMURendererFPSLimit": ContainerProvisioningConstants.fpsLimitDefault,
-            "RendererFPSLimit": ContainerProvisioningConstants.fpsLimitDefault,
+            "QEMURendererFPSLimit": fpsLimit,
+            "RendererFPSLimit": fpsLimit,
             "RNGDevice": true,
             "RTCLocalTime": true,
             "TPMDevice": true,

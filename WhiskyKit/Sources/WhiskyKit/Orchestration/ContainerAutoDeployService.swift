@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// End-to-end automated Windows 11 ARM64 container deployment, v3.2 debloat injection, and offline qcow2 compaction.
+// End-to-end automated Windows 11 ARM64 container deployment, v3.3 debloat injection, and offline qcow2 compaction.
 
 import Combine
 import Foundation
 
-/// Orchestrates zero-redistribution Windows 11 ARM64 installation, v3.2 guest debloat/optimization,
+/// Orchestrates zero-redistribution Windows 11 ARM64 installation, v3.3 guest debloat/optimization,
 /// and offline sparse qcow2 compaction for new and existing managed containers.
 public final class ContainerAutoDeployService: ObservableObject, @unchecked Sendable {
     @Published public private(set) var steps: [AutoDeployStepReport]
@@ -39,8 +39,8 @@ public final class ContainerAutoDeployService: ObservableObject, @unchecked Send
         self.hardwareProfileProvider = hwProvider
         let resolved = UnifiedRuntimeDiscovery.resolve(configuration: configuration, fileManager: fileManager)
         let helperApp = resolved.containerHelperBinaryPath.map {
-            URL(filePath: $0).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-                .path(percentEncoded: false)
+            URL(filePath: $0).deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent().path(percentEncoded: false)
         }
         self.bootstrapService = bootstrapService ?? WindowsImageBootstrapService(commandRunner: runner)
         self.diskCompactor = diskCompactor ?? ContainerDiskCompactor(
@@ -55,11 +55,8 @@ public final class ContainerAutoDeployService: ObservableObject, @unchecked Send
 
     /// Creates a compliant `.utm` container skeleton with sparse `qcow2` disk and mounted install media.
     public func createContainerSkeleton(
-        at bundleURL: URL,
-        diskSizeGiB: Int = 64,
-        windowsISOURL: URL,
-        bootstrapISOURL: URL,
-        settings: UnifiedLaunchSettings = UnifiedLaunchSettings()
+        at bundleURL: URL, diskSizeGiB: Int = 64, windowsISOURL: URL,
+        bootstrapISOURL: URL, settings: UnifiedLaunchSettings = UnifiedLaunchSettings()
     ) async throws -> String {
         let standardized = bundleURL.standardizedFileURL
         guard standardized.pathExtension.lowercased() == "utm" else {
@@ -71,32 +68,34 @@ public final class ContainerAutoDeployService: ObservableObject, @unchecked Send
         guard !fileManager.fileExists(atPath: standardized.path(percentEncoded: false)) else {
             throw UnifiedOrchestrationError.backendUnavailable("目标位置已存在同名容器，请更换名称或目录。")
         }
-
         let dataDir = standardized.appending(path: "Data", directoryHint: .isDirectory)
         try fileManager.createDirectory(at: dataDir, withIntermediateDirectories: true)
         do {
             let vmUUID = UUID().uuidString.uppercased()
             let diskUUID = UUID().uuidString.uppercased()
-            let diskURL = dataDir.appending(path: "\(diskUUID).qcow2")
-            try await diskCompactor.createSparseQCow2(at: diskURL, sizeGiB: diskSizeGiB)
-
-            try await stageMediaFile(
+            try await diskCompactor.createSparseQCow2(
+                at: dataDir.appending(path: "\(diskUUID).qcow2"), sizeGiB: diskSizeGiB
+            )
+            try await ContainerBootstrapPreflight.stageMediaFile(
                 from: windowsISOURL,
-                to: dataDir.appending(path: ContainerAutoDeployConfigBuilder.windowsInstallFilename)
+                to: dataDir.appending(path: ContainerAutoDeployConfigBuilder.windowsInstallFilename),
+                fileManager: fileManager, commandRunner: commandRunner
             )
-            try await stageMediaFile(
+            try await ContainerBootstrapPreflight.stageMediaFile(
                 from: bootstrapISOURL,
-                to: dataDir.appending(path: ContainerAutoDeployConfigBuilder.bootstrapFilename)
+                to: dataDir.appending(path: ContainerAutoDeployConfigBuilder.bootstrapFilename),
+                fileManager: fileManager, commandRunner: commandRunner
             )
-
             let hardware = hardwareProfileProvider()
             let preset = UnifiedLaunchSettings.containerPreset(settings.presetTier, hardware: hardware)
+            let cpuCount = settings.virtualCPUCount ?? preset.virtualCPUCount
+            let fpsLimit = min(ContainerProvisioningConstants.fpsLimitDefault, max(60, hardware.displayRefreshRateHz))
+            let queues = HardwareAutoTuner.recommendedVirtIOBlockQueues(forVCPUCount: cpuCount)
             let spec = ContainerAutoDeployConfigBuilder.Spec(
-                vmUUID: vmUUID,
-                diskUUID: diskUUID,
+                vmUUID: vmUUID, diskUUID: diskUUID,
                 containerName: standardized.deletingPathExtension().lastPathComponent,
-                cpuCount: settings.virtualCPUCount ?? preset.virtualCPUCount,
-                memoryMiB: settings.memoryMiB ?? preset.memoryMiB
+                cpuCount: cpuCount, memoryMiB: settings.memoryMiB ?? preset.memoryMiB,
+                fpsLimit: fpsLimit, virtioBlkQueues: queues
             )
             try ContainerAutoDeployConfigBuilder.writeSkeletonConfigAndMetadata(
                 spec: spec, bundleURL: standardized, fileManager: fileManager
@@ -108,24 +107,24 @@ public final class ContainerAutoDeployService: ObservableObject, @unchecked Send
         }
     }
 
-    /// Removes temporary Windows/bootstrap ISOs from `config.plist` and deletes their copies under `Data/`.
     public func ejectInstallMedia(in bundleURL: URL) throws {
         try ContainerAutoDeployConfigBuilder.ejectInstallMedia(in: bundleURL, fileManager: fileManager)
     }
-
-    /// Runs offline sparse compaction on an existing stopped, managed container.
     public func compactExistingContainer(at bundlePath: String) async throws -> ContainerDiskCompactionReport {
         try await diskCompactor.compactContainerSystemDisk(bundlePath: bundlePath, fileManager: fileManager)
     }
-
-    /// Executes the complete 6-stage automated Windows 11 ARM64 container creation, debloat, and compaction workflow.
     public func deployNewContainer(request: AutoDeployRequest) async throws -> AutoDeployReport {
         await MainActor.run {
             self.isRunning = true
             self.downloadProgress = nil
             self.steps = Self.initialSteps()
         }
-        defer { Task { @MainActor in self.isRunning = false; self.downloadProgress = nil } }
+        defer {
+            Task { @MainActor in
+                self.isRunning = false
+                self.downloadProgress = nil
+            }
+        }
 
         let resolved = UnifiedRuntimeDiscovery.resolve(configuration: configuration, fileManager: fileManager)
         let bundleURL = normalizedBundleURL(for: request)
@@ -134,13 +133,20 @@ public final class ContainerAutoDeployService: ObservableObject, @unchecked Send
 
         let isoURL = try await executeStage(
             .prepareWindowsImage, containerPath: bundlePath, steps: &currentSteps,
-            runningDetail: "正在准备并校验官方 Windows 11 ARM64 镜像…"
-        ) { try await self.prepareImage(request: request) }
+            runningDetail: "正在校验目标磁盘空间与官方 Windows 11 ARM64 镜像…"
+        ) {
+            let minFree: Int64 = request.minimumISOSizeBytes >= 1_073_741_824
+                ? ContainerBootstrapPreflight.minimumNewContainerFreeBytes : 64 * 1_048_576
+            try ContainerBootstrapPreflight.validateStorageTarget(
+                directory: request.destinationDirectory, minimumFreeBytes: minFree, fileManager: self.fileManager
+            )
+            return try await self.prepareImage(request: request)
+        }
 
         let bootstrapISO = try await executeStage(
             .buildBootstrapMedia, containerPath: bundlePath, steps: &currentSteps,
-            runningDetail: "正在打包 autounattend.xml、驱动与优化脚本…"
-        ) { try await self.buildBootstrapMedia(request: request, resolved: resolved) }
+            runningDetail: "正在匹配镜像语言、准备 VirtIO 驱动并生成引导介质…"
+        ) { try await self.buildBootstrapMedia(request: request, windowsISO: isoURL, resolved: resolved) }
         defer { try? fileManager.removeItem(at: bootstrapISO) }
 
         let vmUUID = try await executeStage(
@@ -181,38 +187,38 @@ private extension ContainerAutoDeployService {
 
         _ = try await executeStage(
             .injectOptimizationAndTrim, containerPath: bundlePath, steps: &steps,
-            runningDetail: "正在执行 v3.2 精简（移除 OneDrive/禁用休眠/CompactOS/WinSxS 清理/ReTrim/MPO 修复）…"
+            runningDetail: "正在执行 v3.3 精简（移除云同步/CompactOS/MPO与透明修复/高清模式/全屏光标桥接）…"
         ) {
-            let report = try await self.provisioningService.provisionAndOptimize(
-                containerPath: bundlePath, settings: request.launchSettings
+            try await self.runProvisioningWithRebootRetry(
+                bundlePath: bundlePath, vmUUID: vmUUID, resolved: resolved, request: request
             )
-            guard report.allPassed else {
-                throw UnifiedOrchestrationError.commandFailed("容器内 v3.2 精简优化未全部通过核验。")
-            }
-            return ((), "v3.2 系统精简、去云同步、CompactOS 与图形网络核验全部通过。")
+            return ((), "v3.3 系统精简、清晰渲染、全屏光标桥接与图形网络核验全部通过。")
         }
 
         return try await executeStage(
             .compactAndRegister, containerPath: bundlePath, steps: &steps,
             runningDetail: "正在优雅关机、卸载安装介质并执行离线 qcow2 磁盘瘦身…"
         ) {
-            try await self.gracefulShutdownAndWait(vmUUID: vmUUID, resolved: resolved, request: request)
+            if let control = self.resolvedControlBinary(resolved: resolved) {
+                try await ContainerBootstrapPreflight.gracefulShutdownAndWait(
+                    controlBinary: control, vmUUID: vmUUID,
+                    pollIntervalSeconds: request.pollIntervalSeconds, commandRunner: self.commandRunner
+                )
+            }
             try self.ejectInstallMedia(in: bundleURL)
             let report = try await self.diskCompactor.compactContainerSystemDisk(
                 bundlePath: bundlePath, fileManager: self.fileManager
             )
-            let beforeText = String(format: "%.1f", report.beforeGiB)
-            let afterText = String(format: "%.1f", report.afterGiB)
-            return (
-                report,
-                "已卸载安装镜像并瘦身：\(beforeText) GiB → \(afterText) GiB（英文原版镜像联网后可在游戏库一键补齐中文输入法）。"
+            let msg = String(
+                format: "已卸载安装镜像并瘦身：%.1f GiB → %.1f GiB（英文镜像联网后可在游戏库一键补齐中文输入法）。",
+                report.beforeGiB, report.afterGiB
             )
+            return (report, msg)
         }
     }
+
     static func initialSteps() -> [AutoDeployStepReport] {
-        AutoDeployStage.allCases.map {
-            AutoDeployStepReport(stage: $0, state: .pending, detail: "等待执行")
-        }
+        AutoDeployStage.allCases.map { AutoDeployStepReport(stage: $0, state: .pending, detail: "等待执行") }
     }
 
     func normalizedBundleURL(for request: AutoDeployRequest) -> URL {
@@ -225,50 +231,63 @@ private extension ContainerAutoDeployService {
     func prepareImage(request: AutoDeployRequest) async throws -> (URL, String) {
         switch request.imageSource {
         case let .localISO(url):
-            let validated = try bootstrapService.validateWindowsARM64ISO(
+            let res = try bootstrapService.validateWindowsARM64ISO(
                 at: url, minimumSizeBytes: request.minimumISOSizeBytes, fileManager: fileManager
             )
-            let sizeGiB = String(format: "%.2f", Double(validated.sizeBytes) / 1_073_741_824.0)
-            return (validated.isoURL, "本地镜像校验通过（\(validated.formatSignature)，\(sizeGiB) GiB）。")
+            let sizeGiB = String(format: "%.2f", Double(res.sizeBytes) / 1_073_741_824.0)
+            return (res.isoURL, "本地镜像校验通过（\(res.formatSignature)，\(sizeGiB) GiB）。")
         case let .officialDownloadURL(url, expectedSHA256):
             let downloaded = try await bootstrapService.downloadOfficialISO(
                 from: url, expectedSHA256: expectedSHA256, fileManager: fileManager
-            ) { [weak self] progress in
-                Task { @MainActor in self?.downloadProgress = progress }
-            }
+            ) { [weak self] progress in Task { @MainActor in self?.downloadProgress = progress } }
             return (downloaded, "官方 Windows 11 ARM64 镜像已下载并校验通过。")
         }
     }
 
-    func buildBootstrapMedia(
-        request: AutoDeployRequest,
-        resolved: ResolvedRuntimePaths
-    ) async throws -> (URL, String) {
-        var optimizerFiles: [URL] = []
-        for path in [resolved.optimizerApplyScriptPath, resolved.optimizerProfilePath].compactMap({ $0 }) {
-            optimizerFiles.append(URL(filePath: path))
+    func runProvisioningWithRebootRetry(
+        bundlePath: String, vmUUID: String, resolved: ResolvedRuntimePaths, request: AutoDeployRequest
+    ) async throws {
+        let report: ContainerProvisioningReport
+        do {
+            report = try await provisioningService.provisionAndOptimize(
+                containerPath: bundlePath, settings: request.launchSettings
+            )
+        } catch {
+            guard request.pollIntervalSeconds >= 1.0,
+                  let control = resolvedControlBinary(resolved: resolved) else { throw error }
+            await ContainerBootstrapPreflight.rebootAndWaitForLogon(
+                controlBinary: control, vmUUID: vmUUID, commandRunner: commandRunner
+            )
+            report = try await provisioningService.provisionAndOptimize(
+                containerPath: bundlePath, settings: request.launchSettings
+            )
         }
-        let tempISO = fileManager.temporaryDirectory
-            .appending(path: "malt-bootstrap-\(UUID().uuidString).iso")
-        let built = try await bootstrapService.buildBootstrapISO(
-            outputURL: tempISO,
-            config: request.unattendedConfig,
-            driverDirectory: request.driverDirectory,
-            optimizerFiles: optimizerFiles,
-            fileManager: fileManager
-        )
-        return (built, "已生成 MALTBOOT 无人值守与驱动注入引导镜像。")
+        if !report.allPassed { throw UnifiedOrchestrationError.commandFailed("容器内 v3.3 精简优化未全部通过核验。") }
     }
 
-    func stageMediaFile(from source: URL, to destination: URL) async throws {
-        let srcPath = source.standardizedFileURL.path(percentEncoded: false)
-        let dstPath = destination.standardizedFileURL.path(percentEncoded: false)
-        let clone = try? await commandRunner("/bin/cp", ["-c", srcPath, dstPath], ["__DEMOAPP_TIMEOUT_SECONDS": "60"])
-        if clone?.exitCode == 0 && fileManager.fileExists(atPath: dstPath) {
-            return
-        }
-        try? fileManager.removeItem(at: destination)
-        try fileManager.copyItem(at: source, to: destination)
+    func buildBootstrapMedia(
+        request: AutoDeployRequest, windowsISO: URL, resolved: ResolvedRuntimePaths
+    ) async throws -> (URL, String) {
+        let effectiveConfig = ContainerBootstrapPreflight.resolvedUnattendedConfig(
+            request.unattendedConfig, for: windowsISO, fileManager: fileManager
+        )
+        let requireDrivers = request.minimumISOSizeBytes >= 1_073_741_824
+        let driver = try await ContainerBootstrapPreflight.resolveDriverDirectory(
+            explicit: request.driverDirectory, beside: windowsISO,
+            autoDownload: request.autoDownloadDrivers && requireDrivers, requireDrivers: requireDrivers,
+            bootstrapService: bootstrapService, fileManager: fileManager
+        ) { [weak self] progress in Task { @MainActor in self?.downloadProgress = progress } }
+        var optimizerFiles = [resolved.optimizerApplyScriptPath, resolved.optimizerProfilePath]
+            .compactMap { $0 }.map { URL(filePath: $0) }
+        if let bridge = ContainerProvisioningGuestExecutor.siblingCursorBridgeURL(
+            nextTo: resolved.optimizerApplyScriptPath, fileManager: fileManager
+        ) { optimizerFiles.append(bridge) }
+        let tempISO = fileManager.temporaryDirectory.appending(path: "malt-bootstrap-\(UUID().uuidString).iso")
+        let built = try await bootstrapService.buildBootstrapISO(
+            outputURL: tempISO, config: effectiveConfig,
+            driverDirectory: driver.url, optimizerFiles: optimizerFiles, fileManager: fileManager
+        )
+        return (built, "已生成 MALTBOOT（镜像语言 \(effectiveConfig.setupUILanguage)，\(driver.sourceLabel)）。")
     }
 
     func resolvedControlBinary(resolved: ResolvedRuntimePaths) -> String? {
@@ -303,7 +322,7 @@ private extension ContainerAutoDeployService {
             if attempt < 4 { try await Task.sleep(nanoseconds: 1_500_000_000) }
         }
         if request.pollIntervalSeconds >= 1.0 {
-            await triggerOpticalBootKeypresses()
+            await ContainerBootstrapPreflight.triggerOpticalBootKeypresses(commandRunner: commandRunner)
         }
         let deadline = Date().addingTimeInterval(max(1, request.installTimeoutSeconds))
         let pollNanos = UInt64(max(0.05, request.pollIntervalSeconds) * 1_000_000_000)
@@ -317,44 +336,20 @@ private extension ContainerAutoDeployService {
                 ],
                 ["__DEMOAPP_TIMEOUT_SECONDS": "10"]
             )
-            if probe?.exitCode == 0 && probe?.stdout.contains("MALT_BOOTSTRAP_DONE") == true { return }
-            try await Task.sleep(nanoseconds: pollNanos)
-        }
-        throw UnifiedOrchestrationError.commandFailed("等待 Windows 11 无人值守安装与来宾工具就绪超时。")
-    }
-
-    func triggerOpticalBootKeypresses() async {
-        let safeSpace = "tell application \"System Events\" to if (name of first application process "
-            + "whose frontmost is true) is \"UTM\" then tell process \"UTM\" to key code 49"
-        for _ in 0..<8 {
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            _ = try? await commandRunner("/usr/bin/osascript", ["-e", safeSpace], ["__DEMOAPP_TIMEOUT_SECONDS": "5"])
-        }
-    }
-
-    func gracefulShutdownAndWait(
-        vmUUID: String, resolved: ResolvedRuntimePaths, request: AutoDeployRequest
-    ) async throws {
-        guard let controlBinary = resolvedControlBinary(resolved: resolved) else { return }
-        _ = try? await commandRunner(
-            controlBinary,
-            ["exec", "--hide", vmUUID, "--cmd", "shutdown.exe", "/s", "/t", "2"],
-            ["__DEMOAPP_TIMEOUT_SECONDS": "15"]
-        )
-        let deadline = Date().addingTimeInterval(120)
-        let pollNanos = UInt64(max(0.05, min(2.0, request.pollIntervalSeconds)) * 1_000_000_000)
-        while Date() < deadline {
-            try Task.checkCancellation()
-            let status = try? await commandRunner(
-                controlBinary, ["status", "--hide", vmUUID], ["__DEMOAPP_TIMEOUT_SECONDS": "5"]
-            )
-            let state = status?.stdout.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-            if status?.exitCode == 0 && (state == "stopped" || state.isEmpty) {
-                return
+            if let probe {
+                try ContainerGuestDispatcher.requireAutomationAccess(probe)
+                if probe.exitCode == 0 && probe.stdout.contains("MALT_BOOTSTRAP_DONE") {
+                    if request.pollIntervalSeconds >= 1.0 {
+                        await ContainerBootstrapPreflight.waitForInteractiveUserLogon(
+                            controlBinary: controlBinary, vmUUID: vmUUID, commandRunner: commandRunner
+                        )
+                    }
+                    return
+                }
             }
             try await Task.sleep(nanoseconds: pollNanos)
         }
-        throw UnifiedOrchestrationError.commandFailed("等待容器正常关机超时，未能执行离线磁盘瘦身。")
+        throw UnifiedOrchestrationError.commandFailed("等待 Windows 11 无人值守安装与来宾工具就绪超时。")
     }
 
     func updateStep(
@@ -377,12 +372,12 @@ private extension ContainerAutoDeployService {
             await updateStep(stage, state: .succeeded, detail: detail, in: &steps)
             return value
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            await updateStep(stage, state: .failed, detail: message, in: &steps)
-            let report = AutoDeployReport(
+            let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            await updateStep(stage, state: .failed, detail: msg, in: &steps)
+            let rep = AutoDeployReport(
                 containerPath: containerPath, vmUUID: "", steps: steps, compactionReport: nil, allPassed: false
             )
-            await MainActor.run { self.lastReport = report }
+            await MainActor.run { self.lastReport = rep }
             throw error
         }
     }
@@ -390,10 +385,13 @@ private extension ContainerAutoDeployService {
     func finalizeReport(
         containerPath: String, vmUUID: String, steps: [AutoDeployStepReport], compaction: ContainerDiskCompactionReport
     ) async -> AutoDeployReport {
-        let report = AutoDeployReport(
+        let rep = AutoDeployReport(
             containerPath: containerPath, vmUUID: vmUUID, steps: steps, compactionReport: compaction, allPassed: true
         )
-        await MainActor.run { self.lastReport = report; self.isRunning = false }
-        return report
+        await MainActor.run {
+            self.lastReport = rep
+            self.isRunning = false
+        }
+        return rep
     }
 }

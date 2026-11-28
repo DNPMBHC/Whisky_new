@@ -32,6 +32,7 @@ class PayloadIntegrityTests(unittest.TestCase):
             'optimizerApplyScript': 'Contents/Resources/RuntimeScripts/apply-optimizer.ps1',
             'optimizerRollbackScript': 'Contents/Resources/RuntimeScripts/rollback-optimizer.ps1',
             'optimizerProfile': 'Contents/Resources/RuntimeScripts/anticheat-minimal-win11-arm64.json',
+            'cursorBridgeScript': 'Contents/Resources/RuntimeScripts/malt-cursor-bridge.ps1',
             'provisioningGuide': 'Contents/Resources/RuntimeScripts/PROVISIONING.md',
             'provisioningGuideChinese': 'Contents/Resources/RuntimeScripts/PROVISIONING.zh-Hans.md',
             'networkHelper': 'Contents/Library/HelperTools/network-bridge',

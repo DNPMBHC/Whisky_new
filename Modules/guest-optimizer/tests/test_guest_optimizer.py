@@ -17,6 +17,7 @@ PROFILE_PATH = MODULE_DIR / "profiles" / "anticheat-minimal-win11-arm64.json"
 APPLY_SCRIPT_PATH = MODULE_DIR / "scripts" / "apply-optimizer.ps1"
 ROLLBACK_SCRIPT_PATH = MODULE_DIR / "scripts" / "rollback-optimizer.ps1"
 KIOSK_SCRIPT_PATH = MODULE_DIR / "scripts" / "kiosk-app-shell.ps1"
+CURSOR_BRIDGE_SCRIPT_PATH = MODULE_DIR / "scripts" / "malt-cursor-bridge.ps1"
 RUNNER_PATH = MODULE_DIR / "scripts" / "benchmark-optimizer-clone.py"
 
 spec = importlib.util.spec_from_file_location("benchmark_optimizer_clone", RUNNER_PATH)
@@ -202,8 +203,8 @@ class GuestOptimizerProfileTests(unittest.TestCase):
 
     def test_v31_disables_crashing_spice_webdavd_and_clamps_pagefile(self):
         profile = self.load_profile()
-        self.assertGreaterEqual(profile.get("profile_revision", 1), 4)
-        self.assertEqual(profile.get("profile_version"), "3.1")
+        self.assertGreaterEqual(profile.get("profile_revision", 1), 6)
+        self.assertEqual(profile.get("profile_version"), "3.3")
         svc_map = {s["name"]: s for s in profile["optimization_blacklist"]["services"]}
         self.assertIn("spice-webdavd", svc_map)
         self.assertEqual(svc_map["spice-webdavd"]["target_start_type"], "Disabled")
@@ -215,6 +216,66 @@ class GuestOptimizerProfileTests(unittest.TestCase):
         apply_text = APPLY_SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertIn("effective_available_mb", apply_text)
         self.assertIn("current_pagefile_mb", apply_text)
+
+    def test_v33_real_user_hive_display_stability_and_cursor_bridge_contracts(self):
+        profile = self.load_profile()
+        tweak_map = {
+            (entry["path"], entry["name"]): entry["value"]
+            for entry in profile["optimization_blacklist"]["registry_tweaks"]
+        }
+        self.assertEqual(tweak_map[("HKCU:\\System\\GameConfigStore", "GameDVR_FSEBehaviorMode")], 2)
+        self.assertEqual(tweak_map[("HKCU:\\System\\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode")], 1)
+        self.assertEqual(tweak_map[("HKCU:\\Control Panel\\Mouse", "MouseTrails")], "0")
+        self.assertEqual(tweak_map[("HKCU:\\Control Panel\\Desktop", "DragFullWindows")], "1")
+        self.assertEqual(tweak_map[("HKCU:\\Control Panel\\Desktop", "FontSmoothing")], "2")
+
+        fd = profile["gaming_session_controls"]["footprint_and_display_controls"]
+        self.assertTrue(fd["disable_dwm_mpo_overlay"])
+        self.assertTrue(fd["disable_graphics_overlays"])
+        self.assertTrue(fd["disable_pointer_shadow_and_fade_animations"])
+        self.assertTrue(fd["ensure_hd_display_mode"])
+        self.assertTrue(fd["install_cursor_bridge"])
+
+        apply_text = APPLY_SCRIPT_PATH.read_text(encoding="utf-8")
+        rollback_text = ROLLBACK_SCRIPT_PATH.read_text(encoding="utf-8")
+        for required in (
+            "Get-LoadedRealUserHiveRoots",
+            "MaltDefaultUser",
+            "DisableOverlays",
+            "SPI_SETCURSORSHADOW",
+            "EnsureHdDisplayMode",
+            "MaltCursorBridge",
+        ):
+            self.assertIn(required, apply_text)
+        self.assertIn("Get-LoadedRealUserHiveRoots", rollback_text)
+        self.assertIn("MaltCursorBridge", rollback_text)
+
+        self.assertTrue(CURSOR_BRIDGE_SCRIPT_PATH.is_file())
+        bridge_text = CURSOR_BRIDGE_SCRIPT_PATH.read_text(encoding="utf-8")
+        bridge_lower = bridge_text.lower()
+        for required in (
+            "GetCursorInfo",
+            "GetIconInfo",
+            "GetDIBits",
+            "SHQueryUserNotificationState",
+            "com.malt.cursor.0",
+            "MCB1",
+        ):
+            self.assertIn(required, bridge_text)
+        for forbidden in (
+            "setwindowshookex",
+            "createremotethread",
+            "writeprocessmemory",
+            "virtualallocex",
+            "ntinject",
+            "openprocess",
+            "readprocessmemory",
+            "testsigning on",
+            "nointegritychecks on",
+            "kvm=off",
+            "hv_vendor_id",
+        ):
+            self.assertNotIn(forbidden, bridge_lower)
 
     def test_kiosk_app_shell_script_is_compliant_reversible_and_zero_injection(self):
         self.assertTrue(KIOSK_SCRIPT_PATH.is_file())

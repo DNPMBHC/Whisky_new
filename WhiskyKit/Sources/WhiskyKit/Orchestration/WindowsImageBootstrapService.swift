@@ -38,6 +38,7 @@ public struct UnattendedWindowsConfig: Codable, Equatable, Sendable {
     public var computerName: String
     public var username: String
     public var setupUILanguage: String
+    public var autoDetectSetupLanguage: Bool
     public var locale: String
     public var timeZone: String
     public var imageIndex: Int
@@ -46,6 +47,7 @@ public struct UnattendedWindowsConfig: Codable, Equatable, Sendable {
         computerName: String = "MALT-WIN11",
         username: String = "malt",
         setupUILanguage: String = "en-US",
+        autoDetectSetupLanguage: Bool = true,
         locale: String = "zh-CN",
         timeZone: String = "China Standard Time",
         imageIndex: Int = 1
@@ -53,6 +55,7 @@ public struct UnattendedWindowsConfig: Codable, Equatable, Sendable {
         self.computerName = computerName
         self.username = username
         self.setupUILanguage = setupUILanguage
+        self.autoDetectSetupLanguage = autoDetectSetupLanguage
         self.locale = locale
         self.timeZone = timeZone
         self.imageIndex = max(1, imageIndex)
@@ -67,12 +70,8 @@ public struct WindowsImageBootstrapService: Sendable {
     private let commandRunner: CommandRunner
 
     public init(commandRunner: CommandRunner? = nil) {
-        self.commandRunner = commandRunner ?? { executable, arguments, environment in
-            try await OrchestratorProcessRunner.run(
-                executable: executable,
-                arguments: arguments,
-                environment: environment
-            )
+        self.commandRunner = commandRunner ?? { exe, args, env in
+            try await OrchestratorProcessRunner.run(executable: exe, arguments: args, environment: env)
         }
     }
 
@@ -112,11 +111,12 @@ public struct WindowsImageBootstrapService: Sendable {
         return WindowsImageValidationResult(isoURL: standardized, sizeBytes: sizeBytes, formatSignature: signature)
     }
 
-    /// Downloads an official HTTPS Windows 11 ARM64 ISO with HTTP Range resume and optional SHA-256 verification.
+    /// Downloads an official HTTPS ISO with HTTP Range resume and optional SHA-256 verification.
     public func downloadOfficialISO(
         from sourceURL: URL,
         expectedSHA256: String? = nil,
         destinationDirectory: URL? = nil,
+        minimumSizeBytes: Int64 = 1_073_741_824,
         fileManager: FileManager = .default,
         onProgress: (@Sendable (WindowsImageDownloadProgress) -> Void)? = nil
     ) async throws -> URL {
@@ -168,8 +168,24 @@ public struct WindowsImageBootstrapService: Sendable {
             try fileManager.removeItem(at: finalURL)
         }
         try fileManager.moveItem(at: partURL, to: finalURL)
-        _ = try validateWindowsARM64ISO(at: finalURL, fileManager: fileManager)
+        _ = try validateWindowsARM64ISO(at: finalURL, minimumSizeBytes: minimumSizeBytes, fileManager: fileManager)
         return finalURL
+    }
+
+    /// Downloads and caches the official open-source UTM guest tools ISO if no local copy is present.
+    public func ensureOfficialGuestToolsISO(
+        beside windowsISO: URL? = nil, fileManager: FileManager = .default,
+        onProgress: (@Sendable (WindowsImageDownloadProgress) -> Void)? = nil
+    ) async throws -> URL {
+        if let local = ContainerBootstrapPreflight.discoverLocalDriverSource(
+            beside: windowsISO, fileManager: fileManager
+        ) { return local }
+        return try await downloadOfficialISO(
+            from: ContainerBootstrapPreflight.officialGuestToolsISOURL,
+            destinationDirectory: ContainerBootstrapPreflight.defaultDriverCacheDirectory(fileManager: fileManager),
+            minimumSizeBytes: ContainerBootstrapPreflight.minimumDriverISOSizeBytes,
+            fileManager: fileManager, onProgress: onProgress
+        )
     }
 
     /// Generates an anti-cheat compliant ARM64 Windows 11 `autounattend.xml` preserving Secure Boot and TPM 2.0.
@@ -186,8 +202,7 @@ public struct WindowsImageBootstrapService: Sendable {
         fileManager: FileManager = .default
     ) async throws -> URL {
         let staging = fileManager.temporaryDirectory.appending(
-            path: "malt-bootstrap-stage-\(UUID().uuidString)",
-            directoryHint: .isDirectory
+            path: "malt-bootstrap-stage-\(UUID().uuidString)", directoryHint: .isDirectory
         )
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: staging) }
@@ -275,10 +290,16 @@ private extension WindowsImageBootstrapService {
             ? nestedDriversRoot : root
         var copiedARM64 = false
         if let children = try? fileManager.contentsOfDirectory(at: searchRoot, includingPropertiesForKeys: nil) {
+            let hasVioGpu3d = children.contains { child in
+                child.lastPathComponent.lowercased() == "viogpu3d"
+                    && fileManager.fileExists(atPath: child.appending(path: "w11/ARM64").path(percentEncoded: false))
+            }
             for child in children {
+                let lowerName = child.lastPathComponent.lowercased()
+                if hasVioGpu3d && lowerName == "viogpudo" { continue }
                 let arm64Dir = child.appending(path: "w11/ARM64", directoryHint: .isDirectory)
                 if fileManager.fileExists(atPath: arm64Dir.path(percentEncoded: false)) {
-                    let isGPUDriver = child.lastPathComponent.lowercased().contains("viogpu")
+                    let isGPUDriver = lowerName == "viogpu3d" || lowerName == "viogpudo"
                     let targetBase = isGPUDriver ? postDrivers : destDrivers
                     try fileManager.createDirectory(at: targetBase, withIntermediateDirectories: true)
                     try fileManager.copyItem(at: arm64Dir, to: targetBase.appending(path: child.lastPathComponent))

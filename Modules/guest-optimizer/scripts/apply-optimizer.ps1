@@ -163,7 +163,7 @@ function Invoke-InteractiveUserScript([string]$ScriptBody, [string]$OutFile, [st
     $princ = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive
     Register-ScheduledTask -TaskName $TaskName -Action $act -Principal $princ -Force | Out-Null
     Start-ScheduledTask -TaskName $TaskName
-    for ($i = 0; $i -lt 20; $i++) {
+    for ($i = 0; $i -lt 30; $i++) {
         if (Test-Path -LiteralPath $OutFile) { break }
         Start-Sleep -Milliseconds 500
     }
@@ -172,6 +172,28 @@ function Invoke-InteractiveUserScript([string]$ScriptBody, [string]$OutFile, [st
         try { return (Get-Content -Raw -LiteralPath $OutFile | ConvertFrom-Json) } catch { return $null }
     }
     return $null
+}
+
+function Get-LoadedRealUserHiveRoots {
+    $roots = @()
+    try {
+        $items = Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue
+        foreach ($item in $items) {
+            $sid = [string]$item.PSChildName
+            if ($sid -match '^S-1-5-21-[0-9-]+$' -and -not $sid.EndsWith('_Classes')) {
+                $roots += ('Registry::HKEY_USERS\' + $sid)
+            }
+        }
+    } catch { }
+    return @($roots)
+}
+
+function Convert-HkcuPathToHivePath([string]$HkcuPath, [string]$HiveRoot) {
+    $suffix = $HkcuPath -replace '^(?i)HKCU:\\', ''
+    if ($HiveRoot -eq 'HKCU:') {
+        return ('HKCU:\' + $suffix)
+    }
+    return ($HiveRoot + '\' + $suffix)
 }
 
 function Get-ActivePowerSchemeGuid {
@@ -407,15 +429,18 @@ function Capture-InitialSnapshot($Profile, [string]$ProfileSha) {
     }
 
     $regSnap = @()
+    $realUserHives = Get-LoadedRealUserHiveRoots
+    $snapHiveRoot = if ($realUserHives.Count -gt 0) { $realUserHives[0] } else { 'HKCU:' }
     foreach ($regEntry in @($Profile.optimization_blacklist.registry_tweaks)) {
         $regPath = [string]$regEntry.path
+        $probePath = Convert-HkcuPathToHivePath $regPath $snapHiveRoot
         $regName = [string]$regEntry.name
         $existed = $false
         $oldVal = $null
         $oldKind = [string]$regEntry.kind
-        if (Test-Path -LiteralPath $regPath) {
+        if (Test-Path -LiteralPath $probePath) {
             try {
-                $item = Get-Item -LiteralPath $regPath -ErrorAction Stop
+                $item = Get-Item -LiteralPath $probePath -ErrorAction Stop
                 if ($item.Property -contains $regName) {
                     $existed = $true
                     $oldVal = $item.GetValue($regName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
@@ -592,23 +617,53 @@ foreach ($pkgName in @($profileData.optimization_blacklist.uwp_packages)) {
     }
 }
 
-foreach ($regEntry in @($profileData.optimization_blacklist.registry_tweaks)) {
-    $regPath = [string]$regEntry.path
-    $regName = [string]$regEntry.name
-    $regKind = [string]$regEntry.kind
-    $regVal = $regEntry.value
-    if ($DryRun) {
-        $registryChanges += [ordered]@{ name = $regName; status = 'dry_run' }
-        continue
-    }
+$targetUserHives = @('HKCU:') + @(Get-LoadedRealUserHiveRoots)
+$defaultNtuserLoaded = $false
+$defaultHiveMountName = 'MaltDefaultUser'
+$defaultNtuserPath = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+if (-not $DryRun -and (Test-Path -LiteralPath $defaultNtuserPath)) {
     try {
-        if (-not (Test-Path -LiteralPath $regPath)) {
-            New-Item -Path $regPath -Force | Out-Null
+        & reg.exe load ("HKU\" + $defaultHiveMountName) $defaultNtuserPath 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $defaultNtuserLoaded = $true
+            $targetUserHives += ('Registry::HKEY_USERS\' + $defaultHiveMountName)
         }
-        New-ItemProperty -Path $regPath -Name $regName -Value $regVal -PropertyType $regKind -Force | Out-Null
-        $registryChanges += [ordered]@{ name = $regName; status = 'applied' }
-    } catch {
-        $registryChanges += [ordered]@{ name = $regName; status = 'skipped_error' }
+    } catch { }
+}
+$targetUserHives = @($targetUserHives | Select-Object -Unique)
+
+try {
+    foreach ($regEntry in @($profileData.optimization_blacklist.registry_tweaks)) {
+        $regPath = [string]$regEntry.path
+        $regName = [string]$regEntry.name
+        $regKind = [string]$regEntry.kind
+        $regVal = $regEntry.value
+        if ($DryRun) {
+            $registryChanges += [ordered]@{ name = $regName; status = 'dry_run'; target_hives = $targetUserHives.Count }
+            continue
+        }
+        $appliedHives = 0
+        foreach ($hiveRoot in $targetUserHives) {
+            $resolvedPath = Convert-HkcuPathToHivePath $regPath $hiveRoot
+            try {
+                if (-not (Test-Path -LiteralPath $resolvedPath)) {
+                    New-Item -Path $resolvedPath -Force | Out-Null
+                }
+                New-ItemProperty -Path $resolvedPath -Name $regName -Value $regVal -PropertyType $regKind -Force | Out-Null
+                $appliedHives++
+            } catch { }
+        }
+        $registryChanges += [ordered]@{
+            name = $regName
+            status = if ($appliedHives -gt 0) { 'applied' } else { 'skipped_error' }
+            targets_applied = $appliedHives
+        }
+    }
+} finally {
+    if ($defaultNtuserLoaded) {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        & reg.exe unload ("HKU\" + $defaultHiveMountName) 2>$null | Out-Null
     }
 }
 
@@ -681,11 +736,16 @@ if ($null -ne $profileData.gaming_session_controls) {
                         $currentPfMb = [int][math]::Floor($pfFile.Length / 1MB)
                     }
                 } catch { }
-                # Dynamically clamp pagefile against current free volume space (preserving >=2048 MiB headroom).
+                # Dynamically clamp pagefile against guest RAM tier & current free volume space (>=2048 MiB headroom).
+                $guestRamMb = if ($null -ne $cs -and $cs.TotalPhysicalMemory -gt 0) {
+                    [int][math]::Round($cs.TotalPhysicalMemory / 1MB)
+                } else { 8192 }
+                $ramCapMaxMb = if ($guestRamMb -le 5120) { 8192 } else { $maxMb }
+                $ramCapInitMb = if ($guestRamMb -le 5120) { 4096 } else { $initMb }
                 $effectiveAvailableMb = $freeMb
                 $ceilingMb = [Math]::Max(2048, $freeMb - 2048)
-                $safeMaxMb = [Math]::Min($maxMb, $ceilingMb)
-                $safeInitMb = [Math]::Min($initMb, $safeMaxMb)
+                $safeMaxMb = [Math]::Min($ramCapMaxMb, $ceilingMb)
+                $safeInitMb = [Math]::Min($ramCapInitMb, $safeMaxMb)
                 if ($cs.AutomaticManagedPagefile) {
                     Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $false } | Out-Null
                 }
@@ -816,7 +876,7 @@ foreach (`$it in `$rawL) {
         }
     }
 
-    # 5. Footprint reduction (OneDrive removal, disable hibernation, CompactOS, WinSxS cleanup + ReTrim) & DWM MPO fix
+    # 5. Footprint reduction, DWM/GraphicsDrivers overlay fix, HD display & Cursor Bridge (v3.3)
     if ($null -ne $gc.footprint_and_display_controls -and $gc.footprint_and_display_controls.enabled -eq $true) {
         $fd = $gc.footprint_and_display_controls
         if ($DryRun) {
@@ -827,6 +887,10 @@ foreach (`$it in `$rawL) {
                 enable_compact_os = [bool]$fd.enable_compact_os
                 cleanup_winsxs_and_retrim = [bool]$fd.cleanup_winsxs_and_retrim
                 disable_dwm_mpo_overlay = [bool]$fd.disable_dwm_mpo_overlay
+                disable_graphics_overlays = [bool]$fd.disable_graphics_overlays
+                disable_pointer_shadow_and_fade_animations = [bool]$fd.disable_pointer_shadow_and_fade_animations
+                ensure_hd_display_mode = [bool]$fd.ensure_hd_display_mode
+                install_cursor_bridge = [bool]$fd.install_cursor_bridge
             }
         } else {
             $fdResult = [ordered]@{}
@@ -842,7 +906,7 @@ foreach (`$it in `$rawL) {
                     }
                     # Prevent OneDrive auto-provisioning on future sign-ins (safe standard policy key)
                     $odPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
-                    New-Item -Path $odPolicy -Force | Out-Null
+                    if (-not (Test-Path -LiteralPath $odPolicy)) { New-Item -Path $odPolicy -Force | Out-Null }
                     New-ItemProperty -Path $odPolicy -Name 'DisableFileSyncNGSC' -PropertyType DWord -Value 1 -Force | Out-Null
                     $fdResult.onedrive = 'removed_and_disabled'
                 } catch {
@@ -860,11 +924,243 @@ foreach (`$it in `$rawL) {
             if ($fd.disable_dwm_mpo_overlay -eq $true) {
                 try {
                     $dwmPath = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'
-                    New-Item -Path $dwmPath -Force | Out-Null
+                    if (-not (Test-Path -LiteralPath $dwmPath)) { New-Item -Path $dwmPath -Force | Out-Null }
                     New-ItemProperty -Path $dwmPath -Name 'OverlayTestMode' -PropertyType DWord -Value 5 -Force | Out-Null
                     $fdResult.dwm_overlay_test_mode = 5
                 } catch {
                     $fdResult.dwm_overlay_test_mode = "error: $($_.Exception.Message)"
+                }
+            }
+            if ($fd.disable_graphics_overlays -eq $true) {
+                try {
+                    $gfxPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
+                    if (-not (Test-Path -LiteralPath $gfxPath)) { New-Item -Path $gfxPath -Force | Out-Null }
+                    New-ItemProperty -Path $gfxPath -Name 'DisableOverlays' -PropertyType DWord -Value 1 -Force | Out-Null
+                    $fdResult.graphics_drivers_disable_overlays = 1
+                } catch {
+                    $fdResult.graphics_drivers_disable_overlays = "error: $($_.Exception.Message)"
+                }
+            }
+            if ($fd.disable_pointer_shadow_and_fade_animations -eq $true -or $fd.ensure_hd_display_mode -eq $true) {
+                try {
+                    $uiOut = Join-Path $StateDirectory 'display-ui-apply-tmp.json'
+                    $applyPointerAnim = if ($fd.disable_pointer_shadow_and_fade_animations -eq $true) { '$true' } else { '$false' }
+                    $applyHdDisplay = if ($fd.ensure_hd_display_mode -eq $true) { '$true' } else { '$false' }
+                    $uiBodyPrefix = "`$outPath = '$uiOut'`r`n`$doUiAnim = $applyPointerAnim`r`n`$doHdDisp = $applyHdDisplay`r`n"
+                    $uiBodyCore = @'
+$ErrorActionPreference = 'Continue'
+$cs = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class MaltDisplayUiHelper
+{
+    private const uint SPI_SETDRAGFULLWINDOWS = 0x0025;
+    private const uint SPI_SETFONTSMOOTHING = 0x004B;
+    private const uint SPI_SETMENUANIMATION = 0x1003;
+    private const uint SPI_SETCOMBOBOXANIMATION = 0x1005;
+    private const uint SPI_SETLISTBOXSMOOTHSCROLLING = 0x1007;
+    private const uint SPI_SETSELECTIONFADE = 0x1015;
+    private const uint SPI_SETTOOLTIPANIMATION = 0x1017;
+    private const uint SPI_SETCURSORSHADOW = 0x101B;
+    private const uint SPI_SETUIEFFECTS = 0x103F;
+    private const uint SPI_SETFONTSMOOTHINGTYPE = 0x200B;
+    private const uint SPIF_UPDATEINIFILE = 0x01;
+    private const uint SPIF_SENDCHANGE = 0x02;
+    private const int ENUM_CURRENT_SETTINGS = -1;
+    private const uint DM_PELSWIDTH = 0x00080000;
+    private const uint DM_PELSHEIGHT = 0x00100000;
+    private const uint DM_DISPLAYFREQUENCY = 0x00400000;
+    private const uint CDS_UPDATEREGISTRY = 0x00000001;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DEVMODEW
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion;
+        public ushort dmDriverVersion;
+        public ushort dmSize;
+        public ushort dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX;
+        public int dmPositionY;
+        public uint dmDisplayOrientation;
+        public uint dmDisplayFixedOutput;
+        public short dmColor;
+        public short dmDuplex;
+        public short dmYResolution;
+        public short dmTTOption;
+        public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel;
+        public uint dmPelsWidth;
+        public uint dmPelsHeight;
+        public uint dmDisplayFlags;
+        public uint dmDisplayFrequency;
+        public uint dmICMMethod;
+        public uint dmICMIntent;
+        public uint dmMediaType;
+        public uint dmDitherType;
+        public uint dmReserved1;
+        public uint dmReserved2;
+        public uint dmPanningWidth;
+        public uint dmPanningHeight;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SystemParametersInfoW(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool EnumDisplaySettingsW(string deviceName, int modeNum, ref DEVMODEW devMode);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int ChangeDisplaySettingsW(ref DEVMODEW devMode, uint flags);
+
+    public static void ApplyCleanUiParams()
+    {
+        uint flags = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE;
+        SystemParametersInfoW(SPI_SETUIEFFECTS, 0, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETCURSORSHADOW, 0, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETMENUANIMATION, 0, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETCOMBOBOXANIMATION, 0, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETLISTBOXSMOOTHSCROLLING, 0, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETTOOLTIPANIMATION, 0, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETSELECTIONFADE, 0, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETDRAGFULLWINDOWS, 1, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETFONTSMOOTHING, 1, IntPtr.Zero, flags);
+        SystemParametersInfoW(SPI_SETFONTSMOOTHINGTYPE, 0, (IntPtr)2, flags);
+    }
+
+    public static string EnsureHdDisplayMode()
+    {
+        DEVMODEW cur = new DEVMODEW();
+        cur.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODEW));
+        if (!EnumDisplaySettingsW(null, ENUM_CURRENT_SETTINGS, ref cur))
+        {
+            return "enum_current_failed";
+        }
+        if (cur.dmPelsWidth >= 1280 && cur.dmPelsHeight >= 720)
+        {
+            return "preserved:" + cur.dmPelsWidth + "x" + cur.dmPelsHeight + "@" + cur.dmDisplayFrequency;
+        }
+        var modes = new List<DEVMODEW>();
+        for (int i = 0; i < 1024; i++)
+        {
+            DEVMODEW m = new DEVMODEW();
+            m.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODEW));
+            if (!EnumDisplaySettingsW(null, i, ref m)) break;
+            if (m.dmBitsPerPel == 32) modes.Add(m);
+        }
+        int[,] targets = new int[,] {
+            { 1920, 1200 }, { 1920, 1080 }, { 1680, 1050 },
+            { 1440, 900 }, { 1280, 800 }, { 1280, 720 }
+        };
+        for (int t = 0; t < targets.GetLength(0); t++)
+        {
+            uint tw = (uint)targets[t, 0];
+            uint th = (uint)targets[t, 1];
+            bool found = false;
+            DEVMODEW best = new DEVMODEW();
+            foreach (var m in modes)
+            {
+                if (m.dmPelsWidth == tw && m.dmPelsHeight == th)
+                {
+                    if (!found || m.dmDisplayFrequency > best.dmDisplayFrequency)
+                    {
+                        best = m;
+                        found = true;
+                    }
+                }
+            }
+            if (found)
+            {
+                best.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+                int rc = ChangeDisplaySettingsW(ref best, CDS_UPDATEREGISTRY);
+                if (rc != 0)
+                {
+                    best.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+                    rc = ChangeDisplaySettingsW(ref best, CDS_UPDATEREGISTRY);
+                }
+                if (rc == 0)
+                {
+                    return "applied:" + best.dmPelsWidth + "x" + best.dmPelsHeight + "@" + best.dmDisplayFrequency;
+                }
+            }
+        }
+        return "unchanged:" + cur.dmPelsWidth + "x" + cur.dmPelsHeight + "@" + cur.dmDisplayFrequency;
+    }
+}
+"@
+Add-Type -TypeDefinition $cs -Language CSharp
+$res = @{ ui_params = 'skipped'; display_mode = 'skipped' }
+if ($doUiAnim) {
+    [MaltDisplayUiHelper]::ApplyCleanUiParams()
+    $res.ui_params = 'applied'
+}
+if ($doHdDisp) {
+    $res.display_mode = [MaltDisplayUiHelper]::EnsureHdDisplayMode()
+}
+$res | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 -LiteralPath $outPath
+'@
+                    $uiRes = Invoke-InteractiveUserScript -ScriptBody ($uiBodyPrefix + $uiBodyCore) -OutFile $uiOut -TaskName 'WhiskyOpt_DisplayAndUi'
+                    $fdResult.interactive_display_and_ui = if ($null -ne $uiRes) { $uiRes } else { 'no_interactive_user' }
+                } catch {
+                    $fdResult.interactive_display_and_ui = "error: $($_.Exception.Message)"
+                }
+            }
+            if ($fd.install_cursor_bridge -eq $true) {
+                try {
+                    $bridgeDir = Join-Path $env:ProgramData 'Malt\CursorBridge'
+                    New-Item -ItemType Directory -Force -Path $bridgeDir | Out-Null
+                    $targetPs1 = Join-Path $bridgeDir 'malt-cursor-bridge.ps1'
+                    $targetExe = Join-Path $bridgeDir 'MaltCursorBridge.exe'
+                    $sourcePs1 = Join-Path $PSScriptRoot 'malt-cursor-bridge.ps1'
+                    if (Test-Path -LiteralPath $sourcePs1) {
+                        if ($sourcePs1 -ine $targetPs1) {
+                            Copy-Item -LiteralPath $sourcePs1 -Destination $targetPs1 -Force
+                        }
+                    }
+                    if (-not (Test-Path -LiteralPath $targetPs1)) {
+                        $fdResult.cursor_bridge = [ordered]@{ status = 'missing_bridge_script' }
+                    } else {
+                        Get-Process -Name 'MaltCursorBridge' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $targetPs1 -CompileOnly -OutputExePath $targetExe 2>$null | Out-Null
+                        $useExe = Test-Path -LiteralPath $targetExe
+                        if ($useExe) {
+                            $bridgeAction = New-ScheduledTaskAction -Execute $targetExe
+                        } else {
+                            $bridgeAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $targetPs1 + '"')
+                        }
+                        $bridgeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+                        $interactiveUser = $null
+                        try { $interactiveUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName } catch { }
+                        if (-not [string]::IsNullOrWhiteSpace($interactiveUser)) {
+                            $bridgeTrigger = New-ScheduledTaskTrigger -AtLogOn -User $interactiveUser
+                            $bridgePrincipal = New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType Interactive -RunLevel Highest
+                        } else {
+                            $bridgeTrigger = New-ScheduledTaskTrigger -AtLogOn
+                            $bridgePrincipal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Administrators' -RunLevel Highest
+                        }
+                        Register-ScheduledTask -TaskName 'MaltCursorBridge' -Action $bridgeAction -Trigger $bridgeTrigger -Principal $bridgePrincipal -Settings $bridgeSettings -Force | Out-Null
+                        $startedNow = $false
+                        if (-not [string]::IsNullOrWhiteSpace($interactiveUser)) {
+                            try {
+                                Start-ScheduledTask -TaskName 'MaltCursorBridge' -ErrorAction SilentlyContinue
+                                Start-Sleep -Milliseconds 600
+                                $startedNow = ($null -ne (Get-Process -Name 'MaltCursorBridge' -ErrorAction SilentlyContinue))
+                            } catch { }
+                        }
+                        $fdResult.cursor_bridge = [ordered]@{
+                            status = 'installed'
+                            binary_compiled = $useExe
+                            started_now = $startedNow
+                            principal = if (-not [string]::IsNullOrWhiteSpace($interactiveUser)) { $interactiveUser } else { 'BUILTIN\Users' }
+                        }
+                    }
+                } catch {
+                    $fdResult.cursor_bridge = [ordered]@{ status = 'error'; message = $_.Exception.Message }
                 }
             }
             if ($fd.enable_compact_os -eq $true) {

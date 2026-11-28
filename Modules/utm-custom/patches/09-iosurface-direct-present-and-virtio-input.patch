@@ -1,8 +1,21 @@
 diff --git a/Configuration/UTMQemuConfiguration+Arguments.swift b/Configuration/UTMQemuConfiguration+Arguments.swift
-index fab94cb..960dbd0 100644
+index fab94cb..8ce2e1e 100644
 --- a/Configuration/UTMQemuConfiguration+Arguments.swift
 +++ b/Configuration/UTMQemuConfiguration+Arguments.swift
-@@ -309,14 +309,21 @@ import Virtualization // for getting network interfaces
+@@ -84,6 +84,12 @@ import Virtualization // for getting network interfaces
+     var swtpmSocketURL: URL {
+         socketURL.appendingPathComponent(information.uuid.uuidString).appendingPathExtension("swtpm")
+     }
++
++    /// Short Unix socket path (<104B UNIX_PATH_MAX) for compliant user-mode cursor state bridge
++    var cursorSocketURL: URL {
++        let shortID = String(information.uuid.uuidString.prefix(12))
++        return socketURL.appendingPathComponent(shortID).appendingPathExtension("cur")
++    }
+     
+     /// Used only if in remote server mode. Holds the files that the main process creates for QEMU.
+     ///
+@@ -309,14 +315,23 @@ import Virtualization // for getting network interfaces
                      if display.hardware.rawValue.lowercased().contains("vga") && isClassicMacNewWorld {
                          "edid=on"
                      }
@@ -11,7 +24,9 @@ index fab94cb..960dbd0 100644
 +                            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
 +                            return raw
 +                        }
-+                        return ProcessInfo.processInfo.physicalMemory <= 20_000_000_000 ? "4G" : "8G"
++                        let physMem = ProcessInfo.processInfo.physicalMemory
++                        if physMem <= 10_737_418_240 { return "2G" }
++                        return physMem <= 21_474_836_480 ? "4G" : "8G"
 +                    }()
                      if display.isGLSupported && isVulkanSupported {
 -                        "hostmem=8G"
@@ -26,7 +41,7 @@ index fab94cb..960dbd0 100644
                              "blob=true"
                          }
                          "neptune=true"
-@@ -363,6 +370,19 @@ import Virtualization // for getting network interfaces
+@@ -363,6 +378,19 @@ import Virtualization // for getting network interfaces
      }
  
      private var directXDriver: UTMQEMUDirectXDriver {
@@ -46,7 +61,7 @@ index fab94cb..960dbd0 100644
          let rawValue = UserDefaults.standard.integer(forKey: "QEMUDirectXDriver")
          return UTMQEMUDirectXDriver(rawValue: rawValue) ?? .qemuDirectXDriverDefault
      }
-@@ -638,9 +658,17 @@ import Virtualization // for getting network interfaces
+@@ -638,9 +666,17 @@ import Virtualization // for getting network interfaces
          system.target
          f(machineProperties)
          if isHypervisorUsed {
@@ -65,7 +80,7 @@ index fab94cb..960dbd0 100644
                  "tso=on"
              }
              if isVulkanSupported {
-@@ -993,6 +1021,13 @@ import Virtualization // for getting network interfaces
+@@ -993,6 +1029,13 @@ import Virtualization // for getting network interfaces
              bootindex += 1
              f()
          } else if drive.interface == .virtio {
@@ -79,13 +94,14 @@ index fab94cb..960dbd0 100644
              f("-device")
              if system.architecture == .s390x {
                  "virtio-blk-ccw"
-@@ -1003,10 +1038,17 @@ import Virtualization // for getting network interfaces
+@@ -1003,10 +1046,18 @@ import Virtualization // for getting network interfaces
              }
              "drive=drive\(drive.id)"
              "serial=\(drive.serial)"
 +            if usePerDiskIOThread {
++                let blkQueues = min(4, max(2, system.cpuCount > 0 ? system.cpuCount : 4))
 +                "iothread=malt_io_\(busindex)"
-+                "num-queues=4"
++                "num-queues=\(blkQueues)"
 +                "queue-size=256"
 +                "write-cache=on"
 +            }
@@ -97,7 +113,7 @@ index fab94cb..960dbd0 100644
              f()
          } else if drive.interface == .nvme {
              f("-device")
-@@ -1096,6 +1138,12 @@ import Virtualization // for getting network interfaces
+@@ -1096,6 +1147,12 @@ import Virtualization // for getting network interfaces
          } else {
              "discard=unmap"
              "detect-zeroes=unmap"
@@ -110,7 +126,7 @@ index fab94cb..960dbd0 100644
          }
          if !isUseFileLock && (!isCd || drive.imageURL != nil) {
              "file.locking=off"
-@@ -1117,14 +1165,48 @@ import Virtualization // for getting network interfaces
+@@ -1117,14 +1174,48 @@ import Virtualization // for getting network interfaces
              f("-device")
              f("usb-tablet,bus=usb-bus.0")
          }
@@ -162,11 +178,39 @@ index fab94cb..960dbd0 100644
          let buses = (maxDevices + 2) / 3
          if input.usbBusSupport == .usb3_0 {
              var controller = "qemu-xhci"
+@@ -1335,6 +1426,19 @@ import Virtualization // for getting network interfaces
+             }
+             "id=org.qemu.guest_agent"
+             f()
++            if !isRemoteSpice
++                && displays.contains(where: { $0.isGLSupported })
++                && ProcessInfo.processInfo.environment["UTM_DISABLE_CURSOR_BRIDGE"] != "1" {
++                f("-chardev")
++                "socket"
++                "id=malt_cursor"
++                "path=\(cursorSocketURL.lastPathComponent)"
++                "server=on"
++                "wait=off"
++                f()
++                f("-device")
++                f("virtserialport,chardev=malt_cursor,name=com.malt.cursor.0")
++            }
+         }
+         if isSpiceAgentUsed {
+             f("-device")
 diff --git a/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift b/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
-index 777cac1..90e3bf7 100644
+index 777cac1..acfb35e 100644
 --- a/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
 +++ b/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
-@@ -164,6 +164,24 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+@@ -16,6 +16,7 @@
+ 
+ import CocoaSpiceRenderer
+ import Carbon.HIToolbox
++import Darwin
+ import SwiftUI
+ 
+ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+@@ -164,6 +165,24 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
              }
          }
  
@@ -191,3 +235,309 @@ index 777cac1..90e3bf7 100644
          if isSecondary && isDisplaySizeDynamic, let window = window {
              restoreDynamicResolution(for: window)
          }
+@@ -199,6 +218,7 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+     }
+ 
+     override func windowWillClose(_ notification: Notification) {
++        MaltCursorBridgeManager.shared.stop(for: self)
+         stopAppShellStateMonitoring()
+         if #available(macOS 14, *), let link = displayLink as? CAMetalDisplayLink {
+             link.invalidate()
+@@ -246,6 +266,9 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+         if let vmDisplay = vmDisplay {
+             displaySizeDidChange(size: vmDisplay.displaySize)
+         }
++        if !isSecondary, let cursorSocketURL = vmQemuConfig?.cursorSocketURL {
++            MaltCursorBridgeManager.shared.start(for: self, socketURL: cursorSocketURL, display: vmDisplay)
++        }
+         super.enterLive()
+         // pick up an FPS limit changed while the window was open
+         updateFrameRate()
+@@ -288,6 +311,7 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+             screenshotView.isHidden = false
+         }
+         if vm.state == .stopped {
++            MaltCursorBridgeManager.shared.stop(for: self)
+             vmDisplay = nil
+             vmInput = nil
+             displaySize = .zero
+@@ -359,6 +383,9 @@ extension VMDisplayQemuMetalWindowController {
+         if !isSecondary && vmDisplay == nil && display.isPrimaryDisplay {
+             vmDisplay = display
+             metalView?.configureRawMouseInput(input: vmInput, display: vmDisplay)
++            if let cursorSocketURL = vmQemuConfig?.cursorSocketURL {
++                MaltCursorBridgeManager.shared.start(for: self, socketURL: cursorSocketURL, display: display)
++            }
+             displaySizeDidChange(size: display.displaySize)
+         } else {
+             super.spiceDidCreateDisplay(display)
+@@ -1322,3 +1349,269 @@ extension VMDisplayQemuMetalWindowController: CAMetalDisplayLinkDelegate {
+         metalView.displayLinkDrawable = nil
+     }
+ }
++
++// MARK: - Compliant User-Mode Cursor State Bridge Client (com.malt.cursor.0)
++
++private final class MaltCursorBridgeManager: @unchecked Sendable {
++    static let shared = MaltCursorBridgeManager()
++
++    private let lock = NSLock()
++    private var clients: [ObjectIdentifier: MaltCursorBridgeClient] = [:]
++
++    func start(for owner: AnyObject, socketURL: URL, display: CSDisplay?) {
++        guard ProcessInfo.processInfo.environment["UTM_DISABLE_CURSOR_BRIDGE"] != "1" else {
++            return
++        }
++        let key = ObjectIdentifier(owner)
++        lock.lock()
++        if let existing = clients[key] {
++            existing.updateDisplay(display)
++            lock.unlock()
++            return
++        }
++        let client = MaltCursorBridgeClient(socketURL: socketURL, display: display)
++        clients[key] = client
++        lock.unlock()
++        client.start()
++    }
++
++    func stop(for owner: AnyObject) {
++        let key = ObjectIdentifier(owner)
++        lock.lock()
++        let client = clients.removeValue(forKey: key)
++        lock.unlock()
++        client?.stop()
++    }
++}
++
++private final class MaltCursorBridgeClient: @unchecked Sendable {
++    private struct CachedShape {
++        let data: Data
++        let width: UInt
++        let height: UInt
++        let hotspot: CGPoint
++        var point: CGPoint
++        var visible: Bool
++    }
++
++    private let socketPath: String
++    private let queue = DispatchQueue(label: "com.malt.cursor-bridge", qos: .userInteractive)
++    private let stateLock = NSLock()
++    private weak var display: CSDisplay?
++    private var cachedShape: CachedShape?
++    private var stopped = false
++    private var activeFD: Int32 = -1
++
++    init(socketURL: URL, display: CSDisplay?) {
++        self.socketPath = socketURL.path
++        self.display = display
++    }
++
++    func updateDisplay(_ display: CSDisplay?) {
++        stateLock.lock()
++        self.display = display
++        let replay = cachedShape
++        stateLock.unlock()
++        if let replay = replay, replay.visible {
++            display?.cursor?.applyExternalCursorShape(
++                data: replay.data,
++                width: replay.width,
++                height: replay.height,
++                hotspot: replay.hotspot,
++                at: replay.point,
++                visible: true
++            )
++        }
++    }
++
++    func start() {
++        queue.async { [weak self] in
++            self?.runLoop()
++        }
++    }
++
++    func stop() {
++        stateLock.lock()
++        stopped = true
++        let fd = activeFD
++        activeFD = -1
++        stateLock.unlock()
++        if fd >= 0 {
++            _ = Darwin.shutdown(fd, SHUT_RDWR)
++            _ = Darwin.close(fd)
++        }
++    }
++
++    private func isStopped() -> Bool {
++        stateLock.lock()
++        let value = stopped
++        stateLock.unlock()
++        return value
++    }
++
++    private func currentDisplay() -> CSDisplay? {
++        stateLock.lock()
++        let cur = display
++        stateLock.unlock()
++        return cur
++    }
++
++    private func runLoop() {
++        while !isStopped() {
++            let fd = connectUnixSocket(path: socketPath)
++            if fd < 0 {
++                Thread.sleep(forTimeInterval: 0.4)
++                continue
++            }
++            stateLock.lock()
++            if stopped {
++                stateLock.unlock()
++                _ = Darwin.close(fd)
++                return
++            }
++            activeFD = fd
++            stateLock.unlock()
++
++            readFrames(from: fd)
++
++            stateLock.lock()
++            if activeFD == fd {
++                activeFD = -1
++            }
++            stateLock.unlock()
++            _ = Darwin.close(fd)
++            if !isStopped() {
++                Thread.sleep(forTimeInterval: 0.4)
++            }
++        }
++    }
++
++    private func connectUnixSocket(path: String) -> Int32 {
++        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
++        guard fd >= 0 else { return -1 }
++        var noSigPipe: Int32 = 1
++        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
++        var addr = sockaddr_un()
++        addr.sun_family = sa_family_t(AF_UNIX)
++        let bytes = Array(path.utf8)
++        let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
++        guard bytes.count > 0 && bytes.count <= maxLen else {
++            _ = Darwin.close(fd)
++            return -1
++        }
++        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
++            for idx in 0..<bytes.count {
++                raw[idx] = bytes[idx]
++            }
++            raw[bytes.count] = 0
++        }
++        let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
++        let rc = withUnsafePointer(to: &addr) { ptr in
++            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
++                Darwin.connect(fd, saPtr, addrLen)
++            }
++        }
++        if rc != 0 {
++            _ = Darwin.close(fd)
++            return -1
++        }
++        return fd
++    }
++
++    private func readExact(fd: Int32, count: Int) -> [UInt8]? {
++        var buffer = [UInt8](repeating: 0, count: count)
++        var offset = 0
++        while offset < count {
++            if isStopped() { return nil }
++            let n = buffer.withUnsafeMutableBytes { raw -> ssize_t in
++                guard let base = raw.baseAddress else { return -1 }
++                return Darwin.read(fd, base.advanced(by: offset), count - offset)
++            }
++            if n <= 0 {
++                if n < 0 && errno == EINTR { continue }
++                return nil
++            }
++            offset += n
++        }
++        return buffer
++    }
++
++    private func readLEInt32(_ buf: [UInt8], _ off: Int) -> Int32 {
++        let v = UInt32(buf[off])
++            | (UInt32(buf[off + 1]) << 8)
++            | (UInt32(buf[off + 2]) << 16)
++            | (UInt32(buf[off + 3]) << 24)
++        return Int32(bitPattern: v)
++    }
++
++    private func readLEUInt16(_ buf: [UInt8], _ off: Int) -> UInt16 {
++        UInt16(buf[off]) | (UInt16(buf[off + 1]) << 8)
++    }
++
++    private func readLEInt16(_ buf: [UInt8], _ off: Int) -> Int16 {
++        Int16(bitPattern: readLEUInt16(buf, off))
++    }
++
++    private func readFrames(from fd: Int32) {
++        while !isStopped() {
++            guard let hdr = readExact(fd: fd, count: 5) else { return }
++            // Magic "MCB1"
++            guard hdr[0] == 0x4D && hdr[1] == 0x43 && hdr[2] == 0x42 && hdr[3] == 0x31 else {
++                return
++            }
++            let frameType = hdr[4]
++            if frameType == 1 {
++                stateLock.lock()
++                cachedShape?.visible = false
++                stateLock.unlock()
++                currentDisplay()?.cursor?.hideExternalCursor()
++            } else if frameType == 2 {
++                guard let payload = readExact(fd: fd, count: 8) else { return }
++                let x = CGFloat(readLEInt32(payload, 0))
++                let y = CGFloat(readLEInt32(payload, 4))
++                let pt = CGPoint(x: x, y: y)
++                stateLock.lock()
++                cachedShape?.point = pt
++                cachedShape?.visible = true
++                stateLock.unlock()
++                currentDisplay()?.cursor?.applyExternalCursorMove(to: pt, visible: true)
++            } else if frameType == 3 {
++                guard let meta = readExact(fd: fd, count: 16) else { return }
++                let x = CGFloat(readLEInt32(meta, 0))
++                let y = CGFloat(readLEInt32(meta, 4))
++                let width = Int(readLEUInt16(meta, 8))
++                let height = Int(readLEUInt16(meta, 10))
++                let hotX = CGFloat(readLEInt16(meta, 12))
++                let hotY = CGFloat(readLEInt16(meta, 14))
++                guard let flagsBuf = readExact(fd: fd, count: 4) else { return }
++                let visible = (flagsBuf[0] & 0x01) != 0
++                guard width > 0 && height > 0 && width <= 128 && height <= 128 else { return }
++                let pixelCount = width * height * 4
++                guard let pixels = readExact(fd: fd, count: pixelCount) else { return }
++                let data = Data(pixels)
++                let pt = CGPoint(x: x, y: y)
++                let hot = CGPoint(x: hotX, y: hotY)
++                stateLock.lock()
++                cachedShape = CachedShape(
++                    data: data,
++                    width: UInt(width),
++                    height: UInt(height),
++                    hotspot: hot,
++                    point: pt,
++                    visible: visible
++                )
++                stateLock.unlock()
++                currentDisplay()?.cursor?.applyExternalCursorShape(
++                    data: data,
++                    width: UInt(width),
++                    height: UInt(height),
++                    hotspot: hot,
++                    at: pt,
++                    visible: visible
++                )
++            } else {
++                return
++            }
++        }
++    }
++}

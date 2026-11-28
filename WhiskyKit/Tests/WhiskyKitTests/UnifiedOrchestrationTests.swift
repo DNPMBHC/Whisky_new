@@ -879,7 +879,7 @@ extension UnifiedOrchestrationTests {
   func testEntryResourceOverrideOnlyChangesCPUAndMemoryUsingSupportedIntersection() {
     let hardware = makeProfile(chip: "Sample", cores: 12, memGiB: 32)
     XCTAssertEqual(
-      UnifiedLaunchSettings.supportedContainerMemoryOptionsGiB(for: hardware), [8, 12])
+      UnifiedLaunchSettings.supportedContainerMemoryOptionsGiB(for: hardware), [8, 12, 16, 20])
     let global = UnifiedLaunchSettings(
       enableMouseCoalescing: false, blockAccidentalShortcuts: false,
       enableKeyMapping: false, enablePersistentCache: false,
@@ -898,7 +898,7 @@ extension UnifiedOrchestrationTests {
     XCTAssertEqual(global.resolved(for: entry, hardware: hardware), global)
     let high = UnifiedLaunchSettings.containerPreset(.maxPerformance, hardware: hardware)
     XCTAssertEqual(high.virtualCPUCount, 10)
-    XCTAssertEqual(high.memoryMiB, 12 * 1024)
+    XCTAssertEqual(high.memoryMiB, 20 * 1024)
   }
 
   func testWineCachePolicyAppliesWithoutContainerResourceValidation() {
@@ -975,7 +975,7 @@ extension UnifiedOrchestrationTests {
     let recorder = RecordedCommands()
     for settings in [
       UnifiedLaunchSettings(virtualCPUCount: Int.max),
-      UnifiedLaunchSettings(memoryMiB: 16384)
+      UnifiedLaunchSettings(memoryMiB: 20480)
     ] {
       do {
         try await ContainerResourceConfigurator.apply(

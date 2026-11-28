@@ -155,9 +155,9 @@ public struct UnifiedLaunchSettings: Equatable, Sendable {
         return min(max(value, 1), maximum)
     }
 
-    /// These allocations match the existing container manager's validated RAM choices.
+    /// Validated RAM tiers across all Apple Silicon Macs (8 GiB to 128+ GiB).
     public static func supportedContainerMemoryOptionsGiB(for hardware: HardwareProfileSnapshot) -> [Int] {
-        HardwareAutoTuner.safeMemoryOptionsGiB(for: hardware).filter { [6, 8, 10, 12].contains($0) }
+        HardwareAutoTuner.safeMemoryOptionsGiB(for: hardware).filter { [4, 6, 8, 10, 12, 16, 20].contains($0) }
     }
 
     public static func containerPreset(
@@ -169,11 +169,11 @@ public struct UnifiedLaunchSettings: Equatable, Sendable {
         let recommendedRAM = HardwareAutoTuner.recommendedMemoryGiB(for: hardware)
         switch tier {
         case .lowSpecCompatible:
-            return (cpu.first ?? 2, (memory.first ?? 6) * 1024)
+            return (cpu.first ?? 2, (memory.first ?? 4) * 1024)
         case .balanced:
             return (
                 cpu.min(by: { abs($0 - recommendedCPU) < abs($1 - recommendedCPU) }) ?? 2,
-                (memory.min(by: { abs($0 - recommendedRAM) < abs($1 - recommendedRAM) }) ?? 6) * 1024
+                (memory.min(by: { abs($0 - recommendedRAM) < abs($1 - recommendedRAM) }) ?? 4) * 1024
             )
         case .maxPerformance:
             return (cpu.last ?? 2, (memory.last ?? 6) * 1024)
@@ -203,8 +203,10 @@ public struct UnifiedLaunchSettings: Equatable, Sendable {
         // When Raw Input (GCMouse) + CSInput lock-free adaptive coalescing is enabled, disable the
         // legacy 1.5ms main-thread timer so motion dispatches with 0us idle latency.
         let legacyTimerUs = (!enableRawMouseInput && enableMouseCoalescing) ? "1500" : "0"
-        // Cap virgl hostmem to 4G on <=16 GiB unified memory Macs to prevent macOS memory compression storms
-        let hostmemSize = ProcessInfo.processInfo.physicalMemory <= 20_000_000_000 ? "4G" : "8G"
+        // Adaptive virgl hostmem across all Apple Silicon Macs: 2G (8 GiB), 4G (12-18 GiB), 8G (24+ GiB)
+        let hostmemSize = HardwareAutoTuner.recommendedVirglHostmem(
+            forPhysicalMemoryBytes: ProcessInfo.processInfo.physicalMemory
+        )
         var env: [String: String] = [
             "UTM_MOUSE_COALESCE_US": legacyTimerUs,
             "UTM_RAW_MOUSE_INPUT": enableRawMouseInput ? "1" : "0",

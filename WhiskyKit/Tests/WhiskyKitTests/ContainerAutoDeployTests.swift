@@ -109,17 +109,14 @@ final class ContainerAutoDeployTests: XCTestCase {
         XCTAssertTrue(xml.contains(#"processorArchitecture="arm64""#))
         XCTAssertTrue(xml.contains("<DriverPaths>"))
         XCTAssertTrue(xml.contains("BypassNRO"))
-        XCTAssertTrue(xml.contains("OverlayTestMode"))
-        XCTAssertTrue(xml.contains("DisableFileSyncNGSC"))
-        XCTAssertTrue(xml.contains("bootstrap.ps1"))
+        XCTAssertTrue(xml.contains("OverlayTestMode") && xml.contains("DisableOverlays"))
+        XCTAssertTrue(xml.contains("DisableFileSyncNGSC") && xml.contains("bootstrap.ps1"))
         XCTAssertTrue(xml.contains("<Name>maltplayer</Name>"))
-        XCTAssertFalse(xml.contains("HideLocalAccountScreen"))
-        XCTAssertFalse(xml.contains("BypassTPMCheck"))
+        XCTAssertFalse(xml.contains("HideLocalAccountScreen") || xml.contains("BypassTPMCheck"))
         XCTAssertFalse(xml.contains("BypassSecureBootCheck"))
         let script = WindowsUnattendXMLBuilder.bootstrapScript()
-        XCTAssertTrue(script.contains("utm-guest-tools*.exe"))
-        XCTAssertTrue(script.contains("qemu-ga*.msi"))
-        XCTAssertTrue(script.contains("bootstrap.done"))
+        XCTAssertTrue(script.contains("utm-guest-tools*.exe") && script.contains("qemu-ga*.msi"))
+        XCTAssertTrue(script.contains("malt-cursor-bridge.ps1") && script.contains("bootstrap.done"))
     }
 
     func testBuildBootstrapISOStagesFilesAndInvokesHdiutil() async throws {

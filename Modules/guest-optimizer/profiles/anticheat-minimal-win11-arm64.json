@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "profile_revision": 5,
-  "profile_version": "3.2",
+  "profile_revision": 6,
+  "profile_version": "3.3",
   "profile_id": "anticheat-minimal-win11-arm64",
   "owner": "@DNPMBHC",
   "target_os": {
@@ -415,6 +415,62 @@
         "kind": "DWord",
         "value": 0,
         "reason": "Disable Microsoft Edge background prelaunch at user sign-in"
+      },
+      {
+        "path": "HKCU:\\System\\GameConfigStore",
+        "name": "GameDVR_FSEBehaviorMode",
+        "kind": "DWord",
+        "value": 2,
+        "reason": "Disable Windows 11 Fullscreen Optimizations (FSE) to prevent DWM software cursor bypass"
+      },
+      {
+        "path": "HKCU:\\System\\GameConfigStore",
+        "name": "GameDVR_HonorUserFSEBehaviorMode",
+        "kind": "DWord",
+        "value": 1,
+        "reason": "Honor explicit user Fullscreen Optimizations preference"
+      },
+      {
+        "path": "HKCU:\\System\\GameConfigStore",
+        "name": "GameDVR_DXGIHonorFSEWindowsCompatible",
+        "kind": "DWord",
+        "value": 1,
+        "reason": "Keep DXGI fullscreen transitions compatible with DWM composition"
+      },
+      {
+        "path": "HKCU:\\System\\GameConfigStore",
+        "name": "GameDVR_EFSEFeatureFlags",
+        "kind": "DWord",
+        "value": 0,
+        "reason": "Disable experimental fullscreen enhancement flags on virtualized GPU"
+      },
+      {
+        "path": "HKCU:\\Control Panel\\Mouse",
+        "name": "MouseTrails",
+        "kind": "String",
+        "value": "0",
+        "reason": "Keep MouseTrails disabled so SPICE/Windows never suppresses pointer rendering"
+      },
+      {
+        "path": "HKCU:\\Control Panel\\Desktop",
+        "name": "DragFullWindows",
+        "kind": "String",
+        "value": "1",
+        "reason": "Maintain crisp full-window redraws without stale outline trails"
+      },
+      {
+        "path": "HKCU:\\Control Panel\\Desktop",
+        "name": "FontSmoothing",
+        "kind": "String",
+        "value": "2",
+        "reason": "Keep crisp system font smoothing enabled after disabling UI fade animations"
+      },
+      {
+        "path": "HKCU:\\Control Panel\\Desktop",
+        "name": "FontSmoothingType",
+        "kind": "DWord",
+        "value": 2,
+        "reason": "Enable ClearType font smoothing for sharp desktop and launcher text"
       }
     ]
   },
@@ -478,7 +534,11 @@
       "enable_compact_os": true,
       "cleanup_winsxs_and_retrim": true,
       "disable_dwm_mpo_overlay": true,
-      "reason": "Remove OneDrive cloud sync bloat, reclaim 8-12 GiB via hiberfil/WinSxS/CompactOS/ReTrim, and disable DWM MPO bypass to preserve fullscreen cursor and crisp non-hover text"
+      "disable_graphics_overlays": true,
+      "disable_pointer_shadow_and_fade_animations": true,
+      "ensure_hd_display_mode": true,
+      "install_cursor_bridge": true,
+      "reason": "Remove OneDrive bloat, reclaim 8-12 GiB via hiberfil/WinSxS/CompactOS/ReTrim, apply real-user visual/FSE/overlay fixes to stop hover-only text redraws, set crisp HD resolution, and deploy compliant fullscreen CursorBridge"
     }
   }
 }

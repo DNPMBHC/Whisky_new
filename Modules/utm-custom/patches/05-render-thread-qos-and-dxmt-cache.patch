@@ -1,5 +1,5 @@
 diff --git a/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift b/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
-index be380d2..6c01fc4 100644
+index c4e5308..edeb367 100644
 --- a/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
 +++ b/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
 @@ -50,6 +50,8 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
@@ -25,8 +25,7 @@ index be380d2..6c01fc4 100644
              let link = CAMetalDisplayLink(metalLayer: layer)
              link.delegate = self
              link.add(to: .main, forMode: .common)
-@@ -202,6 +211,10 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
-         if let resignActiveToken = resignActiveToken {
+@@ -203,6 +212,10 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
              NotificationCenter.default.removeObserver(resignActiveToken)
          }
          resignActiveToken = nil
@@ -36,6 +35,7 @@ index be380d2..6c01fc4 100644
 +        }
          super.windowWillClose(notification)
      }
+     
 @@ -234,6 +247,12 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
          super.enterLive()
          // pick up an FPS limit changed while the window was open
@@ -166,10 +166,10 @@ index dc9eaef..c5fae58 100644
      runQemu(&funcs, argc, argv, envp);
      return 0;
 diff --git a/Services/UTMQemuSystem.m b/Services/UTMQemuSystem.m
-index c8bbd58..c334501 100644
+index c8bbd58..f528a3b 100644
 --- a/Services/UTMQemuSystem.m
 +++ b/Services/UTMQemuSystem.m
-@@ -140,6 +140,70 @@ - (void)setDirectXDriver:(UTMQEMUDirectXDriver)directXDriver {
+@@ -140,6 +140,71 @@ - (void)setDirectXDriver:(UTMQEMUDirectXDriver)directXDriver {
          self.mutableEnvironment[@"NPT_D3D12_LIBRARY_PATH"] = library.path;
          self.mutableEnvironment[@"NPT_DXGI_LIBRARY_PATH"] = library.path;
          self.mutableEnvironment[@"NPT_BACKEND"] = backend;
@@ -198,6 +198,7 @@ index c8bbd58..c334501 100644
 +                @"dxgi.handleAltTab=False",
 +                @"d3d11.sampleNaNToZero=True",
 +                @"d3d11.defuseFma=True",
++                @"d3d11.ignoreMapFlagNoWait=True",
 +                nil];
 +            NSString *extraDxmtConfig = NSProcessInfo.processInfo.environment[@"UTM_DXMT_EXTRA_CONFIG"];
 +            if (extraDxmtConfig.length > 0) {
@@ -240,7 +241,7 @@ index c8bbd58..c334501 100644
          if (directXDriver == kQEMUDirectXDriverD3DMetal) {
              self.mutableEnvironment[@"NPT_CAPSET_D3D12"] = @"1";
          }
-@@ -152,6 +216,13 @@ - (void)setDirectXDriver:(UTMQEMUDirectXDriver)directXDriver {
+@@ -152,6 +217,13 @@ - (void)setDirectXDriver:(UTMQEMUDirectXDriver)directXDriver {
          [self.mutableEnvironment removeObjectForKey:@"NPT_BACKEND"];
          [self.mutableEnvironment removeObjectForKey:@"NPT_CAPSET_D3D12"];
          [self.mutableEnvironment removeObjectForKey:@"D3DMETAL_FRAMEWORK_PATH"];

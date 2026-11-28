@@ -25,6 +25,28 @@ function Convert-StartModeToStartupType([string]$StartMode) {
     }
 }
 
+function Get-LoadedRealUserHiveRoots {
+    $roots = @()
+    try {
+        $items = Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue
+        foreach ($item in $items) {
+            $sid = [string]$item.PSChildName
+            if ($sid -match '^S-1-5-21-[0-9-]+$' -and -not $sid.EndsWith('_Classes')) {
+                $roots += ('Registry::HKEY_USERS\' + $sid)
+            }
+        }
+    } catch { }
+    return @($roots)
+}
+
+function Convert-HkcuPathToHivePath([string]$HkcuPath, [string]$HiveRoot) {
+    $suffix = $HkcuPath -replace '^(?i)HKCU:\\', ''
+    if ($HiveRoot -eq 'HKCU:') {
+        return ('HKCU:\' + $suffix)
+    }
+    return ($HiveRoot + '\' + $suffix)
+}
+
 function Read-SecurityAndPrismInvariants($Profile) {
     $secureBoot = $null
     try { $secureBoot = [bool](Confirm-SecureBootUEFI) } catch { $secureBoot = $false }
@@ -208,6 +230,9 @@ foreach ($uwp in @($snapshot.uwp_packages)) {
 }
 
 $restoredRegistry = @()
+$rollbackRealUserHives = Get-LoadedRealUserHiveRoots
+$rollbackUserHives = @('HKCU:') + @($rollbackRealUserHives)
+$verifyHiveRoot = if ($rollbackRealUserHives.Count -gt 0) { $rollbackRealUserHives[0] } else { 'HKCU:' }
 foreach ($reg in @($snapshot.registry_tweaks)) {
     $regPath = [string]$reg.path
     $regName = [string]$reg.name
@@ -216,20 +241,27 @@ foreach ($reg in @($snapshot.registry_tweaks)) {
         continue
     }
     try {
-        if ($reg.existed) {
-            if (-not (Test-Path -LiteralPath $regPath)) {
-                New-Item -Path $regPath -Force | Out-Null
+        foreach ($hiveRoot in $rollbackUserHives) {
+            $resolvedPath = Convert-HkcuPathToHivePath $regPath $hiveRoot
+            if ($reg.existed) {
+                if (-not (Test-Path -LiteralPath $resolvedPath)) {
+                    New-Item -Path $resolvedPath -Force | Out-Null
+                }
+                New-ItemProperty -Path $resolvedPath -Name $regName -Value $reg.value -PropertyType ([string]$reg.kind) -Force | Out-Null
+            } else {
+                if (Test-Path -LiteralPath $resolvedPath) {
+                    Remove-ItemProperty -Path $resolvedPath -Name $regName -ErrorAction SilentlyContinue
+                }
             }
-            New-ItemProperty -Path $regPath -Name $regName -Value $reg.value -PropertyType ([string]$reg.kind) -Force | Out-Null
-            $afterVal = (Get-Item -LiteralPath $regPath).GetValue($regName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        $verifyPath = Convert-HkcuPathToHivePath $regPath $verifyHiveRoot
+        if ($reg.existed) {
+            $afterVal = (Get-Item -LiteralPath $verifyPath).GetValue($regName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
             $matched = ([string]$afterVal -eq [string]$reg.value)
         } else {
-            if (Test-Path -LiteralPath $regPath) {
-                Remove-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue
-            }
             $stillExists = $false
-            if (Test-Path -LiteralPath $regPath) {
-                $stillExists = ((Get-Item -LiteralPath $regPath).Property -contains $regName)
+            if (Test-Path -LiteralPath $verifyPath) {
+                $stillExists = ((Get-Item -LiteralPath $verifyPath).Property -contains $regName)
             }
             $matched = (-not $stillExists)
         }
@@ -242,6 +274,13 @@ foreach ($reg in @($snapshot.registry_tweaks)) {
         $mismatches += "registry:$regName:error"
     }
 }
+
+try {
+    Get-Process -Name 'MaltCursorBridge' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    if ($null -ne (Get-ScheduledTask -TaskName 'MaltCursorBridge' -ErrorAction SilentlyContinue)) {
+        Unregister-ScheduledTask -TaskName 'MaltCursorBridge' -Confirm:$false -ErrorAction SilentlyContinue
+    }
+} catch { }
 
 $restoredGaming = [ordered]@{
     update_pause_services = @()

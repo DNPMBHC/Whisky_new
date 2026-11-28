@@ -29,11 +29,14 @@ struct AutomatedContainerDeploySheet: View {
     @State private var officialURLString = ""
     @State private var expectedSHA256 = ""
     @State private var driverDirectoryURL: URL?
+    @State private var autoDownloadDrivers = true
+    @State private var detectedISOLanguage: String?
     @State private var destinationDirectoryURL: URL
     @State private var containerName = "malt-win11-arm64"
     @State private var diskSizeGiB = 64
     @State private var feedbackMessage: String?
     @State private var feedbackIsError = false
+    private let hardwareSnapshot: HardwareProfileSnapshot
 
     init(
         orchestrator: UnifiedRuntimeOrchestrator,
@@ -43,8 +46,12 @@ struct AutomatedContainerDeploySheet: View {
         self.orchestrator = orchestrator
         self.preferences = preferences
         self.onDeployed = onDeployed
+        self.hardwareSnapshot = HardwareAutoTuner().detectHardwareProfile()
         _deployService = StateObject(
             wrappedValue: ContainerAutoDeployService(configuration: orchestrator.configuration)
+        )
+        _driverDirectoryURL = State(
+            initialValue: ContainerBootstrapPreflight.discoverLocalDriverSource(beside: nil)
         )
         let defaultDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
@@ -55,6 +62,7 @@ struct AutomatedContainerDeploySheet: View {
 
     private var canStartDeploy: Bool {
         guard !deployService.isRunning else { return false }
+        guard driverDirectoryURL != nil || autoDownloadDrivers else { return false }
         let trimmedName = containerName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return false }
         switch sourceMode {
@@ -95,14 +103,23 @@ struct AutomatedContainerDeploySheet: View {
     }
 
     private var headerSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let preset = UnifiedLaunchSettings.containerPreset(
+            preferences.runtimeSettings.presetTier, hardware: hardwareSnapshot
+        )
+        let hostmem = HardwareAutoTuner.recommendedVirglHostmem(
+            forPhysicalMemoryBytes: ProcessInfo.processInfo.physicalMemory
+        )
+        let chipLine = "当前本机自适应：\(hardwareSnapshot.chipName)（\(hardwareSnapshot.physicalMemoryGiB) GiB · "
+            + "\(hardwareSnapshot.displayRefreshRateHz) Hz）→ \(preset.virtualCPUCount) vCPU / "
+            + "\(preset.memoryMiB / 1024) GiB RAM / \(hostmem) 显存"
+            + (detectedISOLanguage.map { " · 镜像语言 \($0)" } ?? "")
+        return VStack(alignment: .leading, spacing: 6) {
             Text("一键创建并精简 Windows 11 ARM64 容器")
                 .font(.title3.weight(.semibold))
-            Text("Malt 不分发任何系统镜像。自动流程将保留 Secure Boot / TPM 2.0 合规基线，"
-                 + "注入驱动与 v3.2 优化（移除 OneDrive 云同步、禁休眠、CompactOS、MPO 修复）并离线瘦身磁盘。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Text("Malt 不分发系统镜像，保留 Secure Boot / TPM 2.0，自动注入 VirtIO 驱动与 v3.3 优化（清晰渲染/全屏光标桥接/CompactOS）。")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text(chipLine)
+                .font(.caption2).foregroundStyle(.secondary)
             Link(destination: ContainerProvisioningService.officialWindowsARM64GuideURL()) {
                 Label("打开微软官方 Windows 11 ARM64 下载页", systemImage: "arrow.up.right.square")
                     .font(.caption.weight(.medium))
@@ -175,23 +192,20 @@ struct AutomatedContainerDeploySheet: View {
                     .disabled(deployService.isRunning)
             }
             HStack(spacing: 10) {
-                Text(driverDirectoryURL.map { "驱动包：\($0.lastPathComponent)" } ?? "推荐：选择 VirtIO / viogpu3d 驱动包")
+                Text(driverDirectoryURL.map { "驱动包：\($0.lastPathComponent)" }
+                     ?? (autoDownloadDrivers ? "将自动下载并缓存开源官方 VirtIO 驱动包" : "未选择 VirtIO / viogpu3d 驱动包"))
                     .font(.caption)
-                    .foregroundStyle(driverDirectoryURL == nil ? .orange : .secondary)
+                    .foregroundStyle(driverDirectoryURL == nil && !autoDownloadDrivers ? .orange : .secondary)
                     .lineLimit(1)
                 Spacer()
                 if driverDirectoryURL != nil {
-                    Button("清除") { driverDirectoryURL = nil }
-                        .disabled(deployService.isRunning)
+                    Button("清除") { driverDirectoryURL = nil }.disabled(deployService.isRunning)
                 }
-                Button("选择驱动包…", action: pickDriverDirectory)
-                    .disabled(deployService.isRunning)
+                Button("选择驱动包…", action: pickDriverDirectory).disabled(deployService.isRunning)
             }
             if driverDirectoryURL == nil {
-                Text("提示：未选择驱动包时，WinPE 将无法自动识别 VirtIO 虚拟盘或自动安装 3D 驱动与 QGA。")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                Toggle("自动下载开源官方 VirtIO / QGA 驱动包（推荐，首次下载后本地缓存）", isOn: $autoDownloadDrivers)
+                    .font(.caption2).disabled(deployService.isRunning)
             }
         }
         .padding(12)
@@ -233,19 +247,10 @@ private extension AutomatedContainerDeploySheet {
         }
         if panel.runModal() == .OK, let url = panel.url {
             selectedISOURL = url
+            detectedISOLanguage = ContainerBootstrapPreflight.detectSetupUILanguage(for: url)
             if driverDirectoryURL == nil {
-                driverDirectoryURL = discoverNearbyDriverISO(beside: url)
+                driverDirectoryURL = ContainerBootstrapPreflight.discoverLocalDriverSource(beside: url)
             }
-        }
-    }
-
-    func discoverNearbyDriverISO(beside windowsISO: URL) -> URL? {
-        let parent = windowsISO.deletingLastPathComponent()
-        guard let items = try? FileManager.default.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)
-        else { return nil }
-        return items.first { item in
-            let lower = item.lastPathComponent.lowercased()
-            return lower.hasSuffix(".iso") && (lower.contains("utm-guest-tools") || lower.contains("virtio-win"))
         }
     }
 
@@ -296,6 +301,7 @@ private extension AutomatedContainerDeploySheet {
             containerName: containerName,
             diskSizeGiB: diskSizeGiB,
             driverDirectory: driverDirectoryURL,
+            autoDownloadDrivers: autoDownloadDrivers,
             launchSettings: preferences.runtimeSettings
         )
         Task {

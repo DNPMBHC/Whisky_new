@@ -78,6 +78,8 @@ enum WindowsUnattendXMLBuilder {
             + #"/v OverlayTestMode /t REG_DWORD /d 5 /f"#
         let cmd3 = #"cmd.exe /c reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "#
             + #"/v DisableFileSyncNGSC /t REG_DWORD /d 1 /f"#
+        let cmd4 = #"cmd.exe /c reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "#
+            + #"/v DisableOverlays /t REG_DWORD /d 1 /f"#
         return """
           <settings pass="specialize">
             <component name="Microsoft-Windows-Shell-Setup" \(arm64Attrs)>
@@ -88,6 +90,7 @@ enum WindowsUnattendXMLBuilder {
                 <RunSynchronousCommand \(wcmAdd)><Order>1</Order><Path>\(xmlEscape(cmd1))</Path></RunSynchronousCommand>
                 <RunSynchronousCommand \(wcmAdd)><Order>2</Order><Path>\(xmlEscape(cmd2))</Path></RunSynchronousCommand>
                 <RunSynchronousCommand \(wcmAdd)><Order>3</Order><Path>\(xmlEscape(cmd3))</Path></RunSynchronousCommand>
+                <RunSynchronousCommand \(wcmAdd)><Order>4</Order><Path>\(xmlEscape(cmd4))</Path></RunSynchronousCommand>
               </RunSynchronous>
             </component>
           </settings>
@@ -113,15 +116,30 @@ enum WindowsUnattendXMLBuilder {
     static func bootstrapScript() -> String {
         """
         $ErrorActionPreference = 'Continue'
+        New-Item -ItemType Directory -Path 'C:\\ProgramData\\Malt' -Force | Out-Null
+        $log = 'C:\\ProgramData\\Malt\\bootstrap.log'
+        function Log($m) { Add-Content -Path $log -Value ((Get-Date -Format 's') + ' ' + $m) -Encoding UTF8 }
+        Log 'bootstrap_start'
         $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq 'MALTBOOT' } | Select-Object -First 1
         if ($vol) {
             $root = $vol.DriveLetter + ':'
+            Log ('maltboot_root=' + $root)
+        \(bootstrapDriverAndServiceSteps())
+        }
+        Log 'bootstrap_done'
+        Set-Content -Path 'C:\\ProgramData\\Malt\\bootstrap.done' -Value 'OK' -Encoding ASCII
+        """
+    }
+
+    private static func bootstrapDriverAndServiceSteps() -> String {
+        """
             $exe = Get-ChildItem $root -Recurse -Filter 'utm-guest-tools*.exe' -EA SilentlyContinue |
                 Select-Object -First 1
-            if ($exe) { Start-Process $exe.FullName -ArgumentList '/S' -Wait }
+            if ($exe) { Log ('run_guest_tools=' + $exe.Name); Start-Process $exe.FullName -ArgumentList '/S' -Wait }
             $msi = Get-ChildItem $root -Recurse -Filter 'qemu-ga*.msi' -EA SilentlyContinue |
                 Select-Object -First 1
             if ($msi) {
+                Log ('run_qemu_ga_msi=' + $msi.Name)
                 $msiArg = '"' + $msi.FullName + '"'
                 Start-Process msiexec.exe -ArgumentList '/i', $msiArg, '/qn', '/norestart' -Wait
             }
@@ -133,18 +151,28 @@ enum WindowsUnattendXMLBuilder {
                     }
                 }
                 Get-ChildItem ($root + '\\PostDrivers') -Recurse -Filter '*.inf' -EA SilentlyContinue | ForEach-Object {
+                    Log ('install_post_driver=' + $_.Name)
                     pnputil.exe /add-driver $_.FullName /install | Out-Null
                 }
             }
-            sc.exe config 'QEMU Guest Agent' start= auto | Out-Null
-            Start-Service 'QEMU Guest Agent' -ErrorAction SilentlyContinue
+            foreach ($svc in @('QEMU-GA', 'QEMU Guest Agent')) {
+                sc.exe config $svc start= auto 2>$null | Out-Null
+                for ($try = 0; $try -lt 3; $try++) {
+                    Start-Service $svc -ErrorAction SilentlyContinue
+                    $s = Get-Service $svc -ErrorAction SilentlyContinue
+                    if ($s -and $s.Status -eq 'Running') { Log ('qga_running=' + $svc); break }
+                    Start-Sleep -Seconds 2
+                }
+            }
             if (Test-Path ($root + '\\GuestOptimizer')) {
                 New-Item -ItemType Directory -Path 'C:\\ProgramData\\Malt\\GuestOptimizer' -Force | Out-Null
                 Copy-Item ($root + '\\GuestOptimizer\\*') 'C:\\ProgramData\\Malt\\GuestOptimizer\\' -Force
+                $cb = $root + '\\GuestOptimizer\\malt-cursor-bridge.ps1'
+                if (Test-Path $cb) {
+                    New-Item -ItemType Directory -Path 'C:\\ProgramData\\Malt\\CursorBridge' -Force | Out-Null
+                    Copy-Item $cb 'C:\\ProgramData\\Malt\\CursorBridge\\malt-cursor-bridge.ps1' -Force
+                }
             }
-        }
-        New-Item -ItemType Directory -Path 'C:\\ProgramData\\Malt' -Force | Out-Null
-        Set-Content -Path 'C:\\ProgramData\\Malt\\bootstrap.done' -Value 'OK' -Encoding ASCII
         """
     }
 

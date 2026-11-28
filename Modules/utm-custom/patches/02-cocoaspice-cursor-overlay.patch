@@ -1,16 +1,18 @@
 diff --git a/Sources/CocoaSpice/CSCursor.m b/Sources/CocoaSpice/CSCursor.m
-index e1030ab..00eeed8 100644
+index e1030ab..f46d2db 100644
 --- a/Sources/CocoaSpice/CSCursor.m
 +++ b/Sources/CocoaSpice/CSCursor.m
-@@ -29,6 +29,7 @@ @interface CSCursor ()
+@@ -29,6 +29,9 @@ @interface CSCursor ()
  @property (nonatomic, readwrite) CGPoint cursorHotspot;
  @property (nonatomic, readwrite) BOOL hasCursor;
  @property (nonatomic, readwrite) BOOL cursorHidden;
 +@property (nonatomic, readwrite) BOOL hasServerCursorMove;
++@property (nonatomic) BOOL hasNativeSpiceCursor;
++@property (nonatomic) BOOL usingExternalCursor;
  @property (nonatomic) CGPoint mouseGuest;
  
  @property (nonatomic, nullable, readwrite) id<MTLTexture> texture;
-@@ -39,6 +40,60 @@ @interface CSCursor ()
+@@ -39,6 +42,60 @@ @interface CSCursor ()
  
  @implementation CSCursor
  
@@ -71,7 +73,7 @@ index e1030ab..00eeed8 100644
  #pragma mark - Cursor events
  
  static void cs_cursor_invalidate(CSCursor *self)
-@@ -63,13 +118,64 @@ static void cs_cursor_set(SpiceCursorChannel *channel,
+@@ -63,13 +120,66 @@ static void cs_cursor_set(SpiceCursorChannel *channel,
      
      CGPoint hotspot = CGPointMake(cursor_shape->hot_spot_x, cursor_shape->hot_spot_y);
      CGSize newSize = CGSizeMake(cursor_shape->width, cursor_shape->height);
@@ -129,6 +131,8 @@ index e1030ab..00eeed8 100644
 +    }
      // this has to be after drawCursor: which runs in the same serial queue
      g_boxed_free(SPICE_TYPE_CURSOR_SHAPE, cursor_shape);
++    self.hasNativeSpiceCursor = YES;
++    self.usingExternalCursor = NO;
      self.cursorHidden = NO;
 +    CGSize displaySize = self.display.displaySize;
 +    if (!cs_cursor_point_is_valid(self.mouseGuest, displaySize) &&
@@ -138,7 +142,7 @@ index e1030ab..00eeed8 100644
      cs_cursor_invalidate(self);
  }
  
-@@ -77,12 +183,16 @@ static void cs_cursor_move(SpiceCursorChannel *channel, gint x, gint y, gpointer
+@@ -77,12 +187,16 @@ static void cs_cursor_move(SpiceCursorChannel *channel, gint x, gint y, gpointer
  {
      CSCursor *self = (__bridge CSCursor *)data;
      
@@ -155,24 +159,32 @@ index e1030ab..00eeed8 100644
      
      cs_cursor_invalidate(self);
  }
-@@ -92,6 +202,7 @@ static void cs_cursor_hide(SpiceCursorChannel *channel, gpointer data)
+@@ -90,8 +204,12 @@ static void cs_cursor_move(SpiceCursorChannel *channel, gint x, gint y, gpointer
+ static void cs_cursor_hide(SpiceCursorChannel *channel, gpointer data)
+ {
      CSCursor *self = (__bridge CSCursor *)data;
-     
+-    
++
++    if (self.usingExternalCursor && !self.hasNativeSpiceCursor) {
++        return;
++    }
      self.cursorHidden = YES;
 +    cs_cursor_log_probe([NSString stringWithFormat:@"[Malt-Cursor] event=hide has=%d pos=(%.1f,%.1f)", self.hasCursor, self.mouseGuest.x, self.mouseGuest.y]);
      cs_cursor_invalidate(self);
  }
  
-@@ -100,6 +211,8 @@ static void cs_cursor_reset(SpiceCursorChannel *channel, gpointer data)
+@@ -100,6 +218,10 @@ static void cs_cursor_reset(SpiceCursorChannel *channel, gpointer data)
      CSCursor *self = (__bridge CSCursor *)data;
      
      SPICE_DEBUG("[CocoaSpice] %s",  __FUNCTION__);
 +    self.hasServerCursorMove = NO;
++    self.hasNativeSpiceCursor = NO;
++    self.usingExternalCursor = NO;
 +    cs_cursor_log_probe(@"[Malt-Cursor] event=reset");
      [self destroyCursor];
      cs_cursor_invalidate(self);
  }
-@@ -115,7 +228,17 @@ static void cs_update_mouse_mode(SpiceChannel *channel, gpointer data)
+@@ -115,8 +237,18 @@ static void cs_update_mouse_mode(SpiceChannel *channel, gpointer data)
      SPICE_DEBUG("[CocoaSpice] mouse mode %u", mouse_mode);
      
      if (mouse_mode == SPICE_MOUSE_MODE_SERVER) {
@@ -191,7 +203,8 @@ index e1030ab..00eeed8 100644
 +                         mouse_mode, self.mouseGuest.x, self.mouseGuest.y, self.hasCursor, self.isVisible]);
  }
  
-@@ -139,7 +262,18 @@ - (void)setSpiceMain:(SpiceMainChannel *)spiceMain {
+ #pragma mark - Properties
+@@ -139,7 +271,18 @@ - (void)setSpiceMain:(SpiceMainChannel *)spiceMain {
  
  - (void)setDisplay:(CSDisplay *)display {
      _display = display;
@@ -211,7 +224,7 @@ index e1030ab..00eeed8 100644
  }
  
  - (id<MTLDevice>)device {
-@@ -147,7 +281,13 @@ - (void)setDisplay:(CSDisplay *)display {
+@@ -147,7 +290,13 @@ - (void)setDisplay:(CSDisplay *)display {
  }
  
  - (BOOL)isVisible {
@@ -226,7 +239,7 @@ index e1030ab..00eeed8 100644
  }
  
  - (BOOL)isInverted {
-@@ -268,7 +408,7 @@ - (void)destroyCursor {
+@@ -268,7 +417,7 @@ - (void)destroyCursor {
  
  - (void)drawCursor:(const void *)buffer {
      CGSize cursorSize = self.cursorSize;
@@ -235,7 +248,7 @@ index e1030ab..00eeed8 100644
          return;
      }
      const NSInteger pixelSize = 4;
-@@ -289,4 +429,27 @@ - (void)moveTo:(CGPoint)point {
+@@ -289,4 +438,122 @@ - (void)moveTo:(CGPoint)point {
      }];
  }
  
@@ -262,6 +275,101 @@ index e1030ab..00eeed8 100644
 +    }];
 +}
 +
++- (void)applyExternalCursorShapeData:(NSData *)bgraPixels
++                               width:(NSUInteger)width
++                              height:(NSUInteger)height
++                             hotspot:(CGPoint)hotspot
++                             atPoint:(CGPoint)point
++                             visible:(BOOL)visible {
++    if (width == 0 || height == 0 || width > 128 || height > 128) {
++        return;
++    }
++    NSUInteger expectedBytes = width * height * 4;
++    if (bgraPixels.length < expectedBytes) {
++        return;
++    }
++    NSData *copiedPixels = [bgraPixels copy];
++    [CSMain.sharedInstance asyncWith:^{
++        if (self.hasNativeSpiceCursor) {
++            return;
++        }
++        CGSize newSize = CGSizeMake((CGFloat)width, (CGFloat)height);
++        if (!self.texture || !self.vertices ||
++            !CGSizeEqualToSize(newSize, self.cursorSize) ||
++            !CGPointEqualToPoint(hotspot, self.cursorHotspot)) {
++            [self rebuildCursorWithSize:newSize center:hotspot];
++        }
++        const uint32_t *pixels = (const uint32_t *)copiedPixels.bytes;
++        NSUInteger total = width * height;
++        NSUInteger opaqueCount = 0;
++        NSUInteger nonZeroRGBCount = 0;
++        for (NSUInteger i = 0; i < total; i++) {
++            uint32_t px = pixels[i];
++            if ((px & 0xFF000000u) != 0) {
++                opaqueCount++;
++            }
++            if ((px & 0x00FFFFFFu) != 0) {
++                nonZeroRGBCount++;
++            }
++        }
++        if (opaqueCount == 0 && nonZeroRGBCount > 0) {
++            uint32_t *fixedPixels = (uint32_t *)malloc(total * sizeof(uint32_t));
++            if (fixedPixels != NULL) {
++                for (NSUInteger i = 0; i < total; i++) {
++                    uint32_t px = pixels[i];
++                    fixedPixels[i] = ((px & 0x00FFFFFFu) != 0) ? (px | 0xFF000000u) : 0u;
++                }
++                [self drawCursor:fixedPixels];
++                free(fixedPixels);
++            } else {
++                [self drawCursor:pixels];
++            }
++        } else {
++            [self drawCursor:pixels];
++        }
++        self.usingExternalCursor = YES;
++        self.hasServerCursorMove = YES;
++        self.mouseGuest = point;
++        self.cursorHidden = !visible;
++        cs_cursor_log_probe([NSString stringWithFormat:@"[Malt-Cursor] event=bridge_set size=%lux%lu hot=(%.0f,%.0f) alpha=%lu rgb=%lu/%lu pos=(%.1f,%.1f) vis=%d",
++                             (unsigned long)width, (unsigned long)height,
++                             hotspot.x, hotspot.y,
++                             (unsigned long)opaqueCount, (unsigned long)nonZeroRGBCount, (unsigned long)total,
++                             point.x, point.y, visible ? 1 : 0]);
++        cs_cursor_invalidate(self);
++    }];
++}
++
++- (void)applyExternalCursorMoveTo:(CGPoint)point visible:(BOOL)visible {
++    [CSMain.sharedInstance asyncWith:^{
++        if (self.hasNativeSpiceCursor) {
++            return;
++        }
++        self.usingExternalCursor = YES;
++        self.hasServerCursorMove = YES;
++        self.mouseGuest = point;
++        if (self.hasCursor) {
++            self.cursorHidden = !visible;
++        }
++        cs_cursor_invalidate(self);
++    }];
++}
++
++- (void)hideExternalCursor {
++    [CSMain.sharedInstance asyncWith:^{
++        if (self.hasNativeSpiceCursor) {
++            return;
++        }
++        self.usingExternalCursor = YES;
++        if (!self.cursorHidden) {
++            self.cursorHidden = YES;
++            cs_cursor_log_probe([NSString stringWithFormat:@"[Malt-Cursor] event=bridge_hide pos=(%.1f,%.1f)",
++                                 self.mouseGuest.x, self.mouseGuest.y]);
++            cs_cursor_invalidate(self);
++        }
++    }];
++}
++
  @end
 diff --git a/Sources/CocoaSpice/CSDisplay.m b/Sources/CocoaSpice/CSDisplay.m
 index 656fc1d..fbb8496 100644
@@ -280,10 +388,10 @@ index 656fc1d..fbb8496 100644
  
  - (SpiceChannel *)spiceChannel {
 diff --git a/Sources/CocoaSpice/include/CSCursor.h b/Sources/CocoaSpice/include/CSCursor.h
-index 0061697..8ddce45 100644
+index 0061697..9ebcc88 100644
 --- a/Sources/CocoaSpice/include/CSCursor.h
 +++ b/Sources/CocoaSpice/include/CSCursor.h
-@@ -43,6 +43,11 @@ NS_ASSUME_NONNULL_BEGIN
+@@ -43,6 +43,29 @@ NS_ASSUME_NONNULL_BEGIN
  /// @param point Point relative to the display
  - (void)moveTo:(CGPoint)point NS_SWIFT_NAME(move(to:));
  
@@ -291,6 +399,24 @@ index 0061697..8ddce45 100644
 +/// has not yet emitted server-side cursor-move events.
 +/// @param delta Relative motion delta in guest display coordinates
 +- (void)applyRelativeFallbackDelta:(CGPoint)delta NS_SWIFT_NAME(applyRelativeFallback(delta:));
++
++/// Inject a compliant user-mode Guest cursor shape and position over Metal when
++/// the virtual display driver does not advertise a native SPICE hardware cursor.
++- (void)applyExternalCursorShapeData:(NSData *)bgraPixels
++                               width:(NSUInteger)width
++                              height:(NSUInteger)height
++                             hotspot:(CGPoint)hotspot
++                             atPoint:(CGPoint)point
++                             visible:(BOOL)visible
++    NS_SWIFT_NAME(applyExternalCursorShape(data:width:height:hotspot:at:visible:));
++
++/// Update position and visibility for an external Guest cursor overlay.
++- (void)applyExternalCursorMoveTo:(CGPoint)point
++                          visible:(BOOL)visible
++    NS_SWIFT_NAME(applyExternalCursorMove(to:visible:));
++
++/// Hide an external Guest cursor overlay (e.g. non-fullscreen desktop or FPS aim lock).
++- (void)hideExternalCursor NS_SWIFT_NAME(hideExternalCursor());
 +
  @end
  

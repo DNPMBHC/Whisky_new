@@ -137,6 +137,52 @@ final class ContainerProvisioningServiceTests: XCTestCase {
         )
         XCTAssertNotNil(verified)
     }
+
+    func testV33GraphicsProbeAndSiblingCursorBridgeDiscovery() throws {
+        let script = ContainerProvisioningGuestExecutor.graphicsProbeScript()
+        XCTAssertTrue(script.contains("OverlayTestMode") && script.contains("DisableOverlays"))
+        XCTAssertTrue(script.contains("EnableTransparency") && script.contains("GameDVR_FSEBehaviorMode"))
+        XCTAssertTrue(script.contains("MaltCursorBridge"))
+
+        let fixtures = try makeFakeRuntimeFixtures()
+        let applyPath = fixtures.appBundle
+            .appending(path: "Contents/Resources/RuntimeScripts/apply-optimizer.ps1")
+            .path(percentEncoded: false)
+        let bridgeURL = ContainerProvisioningGuestExecutor.siblingCursorBridgeURL(
+            nextTo: applyPath, fileManager: .default
+        )
+        XCTAssertEqual(bridgeURL?.lastPathComponent, "malt-cursor-bridge.ps1")
+    }
+
+    func testVerifyGraphicsRejectsUnappliedRealUserTransparencyOrOverlay() async throws {
+        let fixtures = try makeFakeRuntimeFixtures()
+        let bundle = try makeUTMBundle(name: "playable-unapplied-ui.utm")
+        let shaderCache = tempDir.appending(path: "shader-cache")
+        let service = makeService(
+            fixtures: fixtures, shaderCacheDir: shaderCache, vmnetSocketActive: false
+        ) { _, args, _ in
+            if args.first == "status" { return OrchestratorCommandResult(exitCode: 0, stdout: "stopped\n") }
+            if args.first == "file" { return OrchestratorCommandResult(exitCode: 0, stdout: "") }
+            if args.contains("GUEST_AGENT_READY") {
+                return OrchestratorCommandResult(exitCode: 0, stdout: "GUEST_AGENT_READY\n")
+            }
+            if let idx = args.firstIndex(of: "-EncodedCommand"), idx + 1 < args.count,
+               let data = Data(base64Encoded: args[idx + 1]),
+               let script = String(data: data, encoding: .utf16LittleEndian),
+               script.contains("MALT_GFX_PROBE_V1=") {
+                let json = #"{"viogpu3dPresent":true,"driverName":"viogpu3d","secureBootEnabled":true,"#
+                    + #""overlayDisabled":true,"userTransparencyDisabled":false,"fseDisabled":true}"#
+                return OrchestratorCommandResult(exitCode: 0, stdout: "MALT_GFX_PROBE_V1=" + json)
+            }
+            return try await Self.makeMockRunner()("", args, [:])
+        }
+        do {
+            _ = try await service.provisionAndOptimize(containerPath: bundle.path(percentEncoded: false))
+            XCTFail("Expected unapplied real-user transparency to fail graphics verification")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("清晰渲染"))
+        }
+    }
 }
 
 private extension ContainerProvisioningServiceTests {
@@ -243,6 +289,7 @@ private extension ContainerProvisioningServiceTests {
         try FileManager.default.createDirectory(at: scriptsDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: helperMacOS, withIntermediateDirectories: true)
         try Data("# apply".utf8).write(to: scriptsDir.appending(path: "apply-optimizer.ps1"))
+        try Data("# bridge".utf8).write(to: scriptsDir.appending(path: "malt-cursor-bridge.ps1"))
         try Data("# rollback".utf8).write(to: scriptsDir.appending(path: "rollback-optimizer.ps1"))
         try Data("{\"schema_version\":1}".utf8)
             .write(to: scriptsDir.appending(path: "anticheat-minimal-win11-arm64.json"))

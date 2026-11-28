@@ -130,9 +130,27 @@ public final class HardwareAutoTuner: Sendable {
             return 12
         case 16..<24:
             return 10
-        default:
+        case 12..<16:
             return 6
+        default:
+            return 4
         }
+    }
+
+    /// Adaptive virgl/venus GPU hostmem budget across all Apple Silicon RAM tiers (8 GiB to 128+ GiB).
+    public static func recommendedVirglHostmem(forPhysicalMemoryBytes bytes: UInt64) -> String {
+        if bytes <= 10_737_418_240 {
+            return "2G"
+        }
+        if bytes <= 21_474_836_480 {
+            return "4G"
+        }
+        return "8G"
+    }
+
+    /// Adaptive VirtIO-Blk queue count bounded to allocated vCPU count so 4-core M1/M2 configs avoid contention.
+    public static func recommendedVirtIOBlockQueues(forVCPUCount cpuCount: Int) -> Int {
+        min(4, max(2, cpuCount))
     }
 
     /// Clamps any persisted or requested GiB memory choice into the hardware's safe GiB choices.
@@ -331,39 +349,37 @@ private extension HardwareAutoTuner {
     }
 
     static func detectDisplayRefreshRateHz() -> Int {
-        guard Thread.isMainThread else {
-            return 120
+        if Thread.isMainThread {
+            let rate = MainActor.assumeIsolated { NSScreen.main?.maximumFramesPerSecond ?? 60 }
+            return max(60, rate)
         }
-        let rate = MainActor.assumeIsolated {
-            NSScreen.main?.maximumFramesPerSecond ?? 60
+        if let mode = CGDisplayCopyDisplayMode(CGMainDisplayID()), mode.refreshRate >= 59.0 {
+            return max(60, Int(mode.refreshRate.rounded()))
         }
-        return max(60, rate)
+        return 60
     }
 
     static func detectRecommendedStoragePath() -> String {
         let fileManager = FileManager.default
-        let volumesURL = URL(filePath: "/Volumes")
         let skipped = Set(["Macintosh HD", "Recovery", "Preboot", "VM", "Update", "DATA"])
         if let volumes = try? fileManager.contentsOfDirectory(
-            at: volumesURL,
+            at: URL(filePath: "/Volumes"),
             includingPropertiesForKeys: [.volumeIsInternalKey, .volumeIsReadOnlyKey],
             options: [.skipsHiddenFiles]
         ) {
-            for volume in volumes.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-                if skipped.contains(volume.lastPathComponent) {
-                    continue
-                }
-                let guestDir = volume.appending(path: "whisky-phase2-guest")
-                if fileManager.isWritableFile(atPath: guestDir.path(percentEncoded: false)) {
-                    return guestDir.path(percentEncoded: false)
+            for volume in volumes.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+            where !skipped.contains(volume.lastPathComponent) {
+                let maltDir = volume.appending(path: "MaltContainers")
+                if fileManager.isWritableFile(atPath: maltDir.path(percentEncoded: false)) {
+                    return maltDir.path(percentEncoded: false)
                 }
                 if fileManager.isWritableFile(atPath: volume.path(percentEncoded: false)) {
                     return volume.path(percentEncoded: false)
                 }
             }
         }
-        return UnifiedGameLibraryStore.defaultStorageURL(fileManager: fileManager)
-            .deletingLastPathComponent()
-            .path(percentEncoded: false)
+        let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser
+        return docs.appending(path: "MaltContainers").path(percentEncoded: false)
     }
 }

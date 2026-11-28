@@ -79,6 +79,11 @@ public struct ContainerDiskCompactor: Sendable {
         let bundleURL = URL(filePath: bundlePath).standardizedFileURL
         let diskURL = try resolvePrimaryQCow2URL(in: bundleURL, fileManager: fileManager)
         let beforeBytes = allocatedDiskBytes(at: diskURL)
+        try ContainerBootstrapPreflight.validateStorageTarget(
+            directory: diskURL.deletingLastPathComponent(),
+            minimumFreeBytes: beforeBytes + 1_073_741_824,
+            fileManager: fileManager
+        )
         let tempURL = diskURL.deletingLastPathComponent()
             .appending(path: ".\(diskURL.deletingPathExtension().lastPathComponent)-compact-tmp.qcow2")
         try? fileManager.removeItem(at: tempURL)
